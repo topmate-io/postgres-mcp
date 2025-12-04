@@ -1,0 +1,47 @@
+steps:
+  # Step 1: Build the custom Docker image with Cloud SQL Proxy
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.cloud-run-fixed'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/postgres-mcp-proxy:latest'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/postgres-mcp-proxy:$BUILD_ID'
+      - '.'
+    id: 'build-image'
+
+  # Step 2: Push to Google Container Registry
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'gcr.io/$PROJECT_ID/postgres-mcp-proxy:latest'
+    id: 'push-image'
+
+  # Step 3: Deploy to Cloud Run
+  - name: 'gcr.io/cloud-builders/gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'postgres-mcp-readonly'
+      - '--region=asia-south1'
+      - '--platform=managed'
+      - '--image=gcr.io/$PROJECT_ID/postgres-mcp-proxy:latest'
+      - '--cpu=2'
+      - '--memory=1Gi'
+      - '--timeout=600'
+      - '--concurrency=80'
+      - '--set-secrets=DATABASE_URI=postgres-mcp-readonly-uri:latest'
+      - '--set-env-vars=ACCESS_MODE=restricted'
+      - '--port=8000'
+      - '--no-allow-unauthenticated'
+      - '--service-account=1058307958897-compute@developer.gserviceaccount.com'
+      - '--project=$PROJECT_ID'
+    id: 'deploy-run'
+
+images:
+  - 'gcr.io/$PROJECT_ID/postgres-mcp-proxy:latest'
+  - 'gcr.io/$PROJECT_ID/postgres-mcp-proxy:$BUILD_ID'
+
+timeout: '3600s'
