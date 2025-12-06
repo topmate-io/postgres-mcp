@@ -20,7 +20,7 @@ def log(msg):
     """Log to both stderr and a file for debugging"""
     try:
         with open(LOG_FILE, "a") as f:
-            f.write(f"{time.time()}: {msg}\n")
+            f.write(f"{msg}\n")
             f.flush()
     except:
         pass
@@ -39,7 +39,7 @@ def get_auth_token() -> str:
         ).strip()
         if not token:
             raise RuntimeError("Empty token")
-        log(f"Got auth token: {token[:20]}...")
+        log("Got auth token")
         return token
     except Exception as e:
         log(f"Auth failed: {e}")
@@ -56,7 +56,7 @@ def sse_reader_thread(token: str, base_url: str, session_id: str, output_queue: 
     ]
 
     try:
-        log(f"Starting SSE reader for session {session_id}")
+        log(f"Starting SSE reader with session {session_id}")
         process = subprocess.Popen(
             curl_cmd,
             stdout=subprocess.PIPE,
@@ -67,26 +67,46 @@ def sse_reader_thread(token: str, base_url: str, session_id: str, output_queue: 
 
         log("SSE process started")
         current_event = None
+        line_count = 0
         for line in iter(process.stdout.readline, ''):
             line = line.rstrip('\n')
             if not line:
+                # Blank line = end of SSE event, reset state
+                current_event = None
                 continue
 
+            line_count += 1
             if line.startswith('event: '):
                 current_event = line[7:].strip()
-                log(f"SSE event: {current_event}")
+                log(f"SSE event {line_count}: {current_event}")
             elif line.startswith('data: '):
                 data = line[6:].strip()
-                if data and current_event != 'endpoint':
-                    try:
-                        json.loads(data)  # Validate JSON
-                        output_queue.put(('sse', data))
-                        log(f"Queued SSE response: {data[:50]}...")
-                    except json.JSONDecodeError as e:
-                        log(f"Invalid JSON from SSE: {data[:50]}... ({e})")
+                if data:
+                    if current_event == 'endpoint':
+                        # Server sends endpoint URL - put it in queue so main thread can use it
+                        output_queue.put(('endpoint', data))
+                        log(f"Got endpoint: {data}")
+                    elif current_event == 'message' or not current_event:
+                        # MCP response message (either with event: message or without event header)
+                        try:
+                            json.loads(data)  # Validate JSON
+                            output_queue.put(('sse', data))
+                            log(f"Queued MCP response")
+                        except json.JSONDecodeError as e:
+                            log(f"Invalid JSON in response: {e}")
+                    else:
+                        # Some other event type we don't recognize, skip it
+                        log(f"Skipping unrecognized event type: {current_event}")
 
         log("SSE process ended")
-        process.wait()
+        returncode = process.wait()
+        log(f"SSE process exit code: {returncode}")
+        if returncode != 0:
+            stderr = process.stderr.read()
+            log(f"SSE stderr: {stderr}")
+            output_queue.put(('sse_closed', f'SSE stream closed with code {returncode}'))
+        else:
+            output_queue.put(('sse_closed', 'SSE stream closed normally'))
     except Exception as e:
         log(f"SSE reader error: {e}")
         log(traceback.format_exc())
@@ -99,7 +119,6 @@ def stdin_reader_thread(input_queue: queue.Queue):
         for line in sys.stdin:
             line = line.strip()
             if line:
-                log(f"Stdin input: {line[:50]}...")
                 input_queue.put(line)
         log("Stdin closed")
         input_queue.put(None)  # Signal EOF
@@ -108,23 +127,25 @@ def stdin_reader_thread(input_queue: queue.Queue):
         log(traceback.format_exc())
         input_queue.put(None)
 
-def send_message_to_server(token: str, base_url: str, session_id: str, message: dict):
+def send_message_to_server(token: str, base_url: str, endpoint_path: str, message: dict):
     """Send a message to the server using curl"""
     try:
+        # Use the endpoint path provided by the server (e.g., "/messages/?session_id=...")
+        full_url = f"{base_url}{endpoint_path}"
         curl_cmd = [
-            "curl", "-s", "-L",  # -L follows redirects
+            "curl", "-s", "-L",
             "-X", "POST",
             "-H", f"Authorization: Bearer {token}",
             "-H", "Content-Type: application/json",
             "-d", json.dumps(message),
-            f"{base_url}/messages?session_id={session_id}"
+            full_url
         ]
 
-        log(f"Sending message: {json.dumps(message)[:50]}...")
+        log(f"Sending: method={message.get('method')}")
         result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=5)
-        log(f"Message sent, return code: {result.returncode}")
+        log(f"Message sent (code {result.returncode})")
         if result.returncode != 0:
-            log(f"Post error: {result.stderr}")
+            log(f"Error: {result.stderr}")
     except Exception as e:
         log(f"Send error: {e}")
 
@@ -135,7 +156,7 @@ def main():
         token = get_auth_token()
         base_url = "https://postgres-mcp-49979260925.asia-south1.run.app"
         session_id = str(uuid.uuid4())
-        log(f"Using session ID: {session_id}")
+        log(f"Session: {session_id}")
 
         output_queue = queue.Queue()
         input_queue = queue.Queue()
@@ -147,7 +168,6 @@ def main():
             daemon=False
         )
         sse_thread.start()
-        log("SSE thread started")
 
         # Start stdin reader thread
         stdin_thread = threading.Thread(
@@ -156,44 +176,87 @@ def main():
             daemon=False
         )
         stdin_thread.start()
-        log("Stdin thread started")
+        log("Threads started")
 
-        loop_count = 0
+        # The server will send us the actual endpoint URL and session ID via SSE
+        message_endpoint = None
+        pending_messages = []  # Queue messages until endpoint arrives
+        endpoint_timeout = time.time() + 10  # Wait max 10 seconds for endpoint
+        endpoint_received = False
+        sse_stream_alive = True
+
+        log("Ready to process messages")
+
         while True:
-            loop_count += 1
-            if loop_count % 1000 == 0:
-                log(f"Main loop running ({loop_count} iterations)")
-
-            # Check for input from stdin (non-blocking)
             try:
-                line = input_queue.get_nowait()
-                if line is None:
-                    log("Got EOF from stdin, exiting")
-                    break
-                log(f"Processing stdin line (len={len(line)}): {line}")
+                # Check for output from SSE reader first (non-blocking)
                 try:
-                    message_obj = json.loads(line)
-                    log(f"Parsed JSON successfully: method={message_obj.get('method')}")
-                    send_message_to_server(token, base_url, session_id, message_obj)
-                except json.JSONDecodeError as e:
-                    log(f"Invalid JSON from stdin: {e}, line={line}")
-            except queue.Empty:
-                pass
+                    event_type, data = output_queue.get_nowait()
+                    if event_type == 'endpoint':
+                        # Capture the endpoint URL from the server
+                        message_endpoint = data
+                        endpoint_received = True
+                        log(f"Using endpoint: {message_endpoint}")
+                        # Process any pending messages now that we have the endpoint
+                        for msg in pending_messages:
+                            send_message_to_server(token, base_url, message_endpoint, msg)
+                        pending_messages = []
+                    elif event_type == 'sse':
+                        log(f"Got response")
+                        sys.stdout.write(data + '\n')
+                        sys.stdout.flush()
+                    elif event_type == 'error':
+                        log(f"SSE error: {data}")
+                        sse_stream_alive = False
+                    elif event_type == 'sse_closed':
+                        log(f"SSE stream closed: {data}")
+                        sse_stream_alive = False
+                except queue.Empty:
+                    pass
 
-            # Check for output from SSE reader (non-blocking)
-            try:
-                event_type, data = output_queue.get_nowait()
-                if event_type == 'sse':
-                    log(f"Writing to stdout: {data[:50]}...")
-                    sys.stdout.write(data + '\n')
+                # Check for timeout waiting for endpoint
+                if not endpoint_received and time.time() > endpoint_timeout:
+                    log("Timeout: No endpoint received from server after 10 seconds")
+                    # Send error to Claude Desktop
+                    error_response = {
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32603,
+                            "message": "MCP server endpoint not received"
+                        }
+                    }
+                    sys.stdout.write(json.dumps(error_response) + '\n')
                     sys.stdout.flush()
-                elif event_type == 'error':
-                    log(f"SSE error: {data}")
-            except queue.Empty:
-                pass
+                    sse_stream_alive = False
 
-            # Small sleep to avoid busy waiting
-            time.sleep(0.01)
+                # Check for input from stdin (non-blocking)
+                try:
+                    line = input_queue.get_nowait()
+                    # Skip None (EOF marker from stdin thread)
+                    if line is not None:
+                        try:
+                            message_obj = json.loads(line)
+                            log(f"Input: {message_obj.get('method')}")
+                            # Queue message if endpoint not ready, or send immediately if ready
+                            if message_endpoint:
+                                send_message_to_server(token, base_url, message_endpoint, message_obj)
+                            else:
+                                log("Queuing message until endpoint is available")
+                                pending_messages.append(message_obj)
+                        except json.JSONDecodeError as e:
+                            log(f"JSON error: {e}")
+                except queue.Empty:
+                    pass
+
+                # Exit if SSE stream is dead and we have no more messages to process
+                if not sse_stream_alive and not pending_messages:
+                    log("SSE stream closed and no pending messages, exiting")
+                    break
+
+                time.sleep(0.01)
+            except Exception as e:
+                log(f"Loop error: {e}")
+                log(traceback.format_exc())
 
     except KeyboardInterrupt:
         log("Interrupted")
@@ -201,7 +264,7 @@ def main():
         log(f"Main error: {e}")
         log(traceback.format_exc())
     finally:
-        log("Wrapper shutting down")
+        log("Shutdown")
 
 if __name__ == "__main__":
     main()
