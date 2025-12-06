@@ -2,7 +2,7 @@
 """
 MCP Stdio to HTTP/SSE Bridge
 Allows Claude Desktop to communicate with remote MCP servers via HTTP/SSE
-Uses subprocess curl for both SSE streaming and message posting
+Uses separate threads for stdin reading and SSE reading to properly handle bidirectional communication
 """
 
 import sys
@@ -59,13 +59,23 @@ def sse_reader_thread(token: str, base_url: str, session_id: str, output_queue: 
                 if data and current_event != 'endpoint':
                     try:
                         json.loads(data)  # Validate JSON
-                        output_queue.put(data)
+                        output_queue.put(('sse', data))
                     except json.JSONDecodeError:
                         pass
 
         process.wait()
     except Exception as e:
-        print(f"SSE reader error: {e}", file=sys.stderr)
+        output_queue.put(('error', str(e)))
+
+def stdin_reader_thread(input_queue: queue.Queue):
+    """Read from stdin"""
+    try:
+        for line in sys.stdin:
+            line = line.strip()
+            if line:
+                input_queue.put(line)
+    except Exception as e:
+        input_queue.put(None)  # Signal EOF
 
 def send_message_to_server(token: str, base_url: str, session_id: str, message: dict):
     """Send a message to the server using curl"""
@@ -79,11 +89,9 @@ def send_message_to_server(token: str, base_url: str, session_id: str, message: 
             f"{base_url}/messages?session_id={session_id}"
         ]
 
-        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            print(f"Message send failed: {result.stderr}", file=sys.stderr)
-    except Exception as e:
-        print(f"Error sending message: {e}", file=sys.stderr)
+        subprocess.run(curl_cmd, capture_output=True, timeout=5)
+    except Exception:
+        pass  # Silently ignore send errors
 
 def main():
     """Main entry point"""
@@ -92,53 +100,61 @@ def main():
     session_id = str(uuid.uuid4())
 
     output_queue = queue.Queue()
+    input_queue = queue.Queue()
 
     # Start SSE reader thread
-    reader = threading.Thread(
+    sse_thread = threading.Thread(
         target=sse_reader_thread,
         args=(token, base_url, session_id, output_queue),
         daemon=False
     )
-    reader.start()
+    sse_thread.start()
 
-    # Give SSE connection time to establish
-    time.sleep(0.2)
+    # Start stdin reader thread
+    stdin_thread = threading.Thread(
+        target=stdin_reader_thread,
+        args=(input_queue,),
+        daemon=False
+    )
+    stdin_thread.start()
 
     try:
         while True:
+            # Check for input from stdin (non-blocking)
+            try:
+                line = input_queue.get_nowait()
+                if line is None:
+                    # stdin closed
+                    break
+                try:
+                    message_obj = json.loads(line)
+                    send_message_to_server(token, base_url, session_id, message_obj)
+                except json.JSONDecodeError:
+                    pass
+            except queue.Empty:
+                pass
+
             # Check for output from SSE reader (non-blocking)
             try:
-                message = output_queue.get_nowait()
-                sys.stdout.write(message + '\n')
-                sys.stdout.flush()
+                event_type, data = output_queue.get_nowait()
+                if event_type == 'sse':
+                    sys.stdout.write(data + '\n')
+                    sys.stdout.flush()
+                elif event_type == 'error':
+                    pass  # Silently log errors
             except queue.Empty:
                 pass
 
             # Small sleep to avoid busy waiting
             time.sleep(0.01)
 
-            # Try to read from stdin
-            try:
-                line = sys.stdin.readline()
-                if not line:
-                    # stdin closed
-                    break
-                line = line.strip()
-                if line:
-                    try:
-                        message_obj = json.loads(line)
-                        send_message_to_server(token, base_url, session_id, message_obj)
-                    except json.JSONDecodeError:
-                        print(f"Error: Invalid JSON received", file=sys.stderr)
-            except EOFError:
-                break
-
     except KeyboardInterrupt:
         pass
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+    except Exception:
+        pass  # Exit silently
     finally:
-        reader.join(timeout=2)
+        sse_thread.join(timeout=2)
+        stdin_thread.join(timeout=2)
 
 if __name__ == "__main__":
     main()
