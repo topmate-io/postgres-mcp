@@ -13,6 +13,7 @@ from typing import Union
 
 import mcp.types as types
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from pydantic import validate_call
 
@@ -32,6 +33,8 @@ from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
+from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
+from .topmate_business_logic import TROUBLESHOOTING_GUIDE
 
 # Initialize FastMCP with default settings
 mcp = FastMCP("postgres-mcp")
@@ -509,6 +512,80 @@ async def get_top_queries(
         return format_error_response(str(e))
 
 
+@mcp.tool(
+    name="get_topmate_schema_guide",
+    description="Returns Topmate database schema reference with table descriptions, key columns, "
+    "common filters, and pre-built SQL query templates for GMV, bookings, and user metrics.",
+)
+async def get_topmate_schema_guide() -> ResponseType:
+    """Get Topmate database schema guide and SQL patterns.
+
+    This tool provides:
+    - Core table descriptions (booking_booking, user_user, services_service, etc.)
+    - Key columns and their purposes
+    - Common filters for each table
+    - Pre-built SQL templates for GMV, expert earnings, user growth
+    """
+    return format_text_response(TOPMATE_SCHEMA_GUIDE)
+
+
+@mcp.tool(
+    name="get_topmate_troubleshooting_guide",
+    description="Provides troubleshooting guidance for common SQL issues when querying Topmate database. "
+    "Covers slow queries, incorrect results, complex aggregations, booking queries, and user metrics.",
+)
+async def get_topmate_troubleshooting_guide() -> ResponseType:
+    """Get troubleshooting guide for Topmate SQL queries.
+
+    Returns guidance for common issues including:
+    - Slow query optimization
+    - Incorrect result debugging
+    - Complex aggregation fixes
+    - Booking/GMV query patterns
+    - User metrics accuracy
+    """
+    return format_text_response(TROUBLESHOOTING_GUIDE)
+
+
+# Add health check endpoints using FastMCP's router
+# These are checked by Kubernetes liveness/readiness probes
+try:
+    @mcp.router.get("/")
+    async def root_health_check():
+        """Root health check endpoint for Kubernetes probes."""
+        try:
+            if db_connection.pool is None:
+                return {"status": "unhealthy"}
+
+            # Quick database connectivity check
+            async with db_connection.pool.connection() as conn:
+                await conn.execute("SELECT 1")
+
+            return {"status": "healthy"}
+        except Exception as e:
+            logger.debug(f"Root health check failed: {e}")
+            # Still return 200 if server is up, even if DB check fails
+            return {"status": "up"}
+
+    @mcp.router.get("/health")
+    async def health_check_endpoint():
+        """Detailed health check endpoint."""
+        try:
+            if db_connection.pool is None:
+                return {"status": "unhealthy", "reason": "Database pool not ready"}
+
+            # Quick database connectivity check
+            async with db_connection.pool.connection() as conn:
+                await conn.execute("SELECT 1")
+
+            return {"status": "healthy"}
+        except Exception as e:
+            logger.debug(f"Health check failed: {e}")
+            return {"status": "unhealthy", "reason": str(e)}
+except (AttributeError, RuntimeError) as e:
+    logger.warning(f"Could not add health endpoints via mcp.router: {e}")
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -592,6 +669,13 @@ async def main():
         # Update FastMCP settings based on command line arguments
         mcp.settings.host = args.sse_host
         mcp.settings.port = args.sse_port
+
+        # Configure transport security to allow all hosts (like eden_gardens' ALLOWED_HOSTS = "*")
+        # This disables DNS rebinding protection for compatibility with load balancers and ingress
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=False
+        )
+
         await mcp.run_sse_async()
 
 
@@ -617,4 +701,4 @@ async def shutdown(sig=None):
         logger.error(f"Error closing database connections: {e}")
 
     # Exit with appropriate status code
-    sys.exit(128 + sig if sig is not None else 0)
+    sys.exit(128 + sig.value if sig is not None else 0)
