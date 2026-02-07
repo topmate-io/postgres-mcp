@@ -1,0 +1,40 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: postgres-mcp-ingress
+  namespace: postgres-mcp
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # SSE requires long idle timeout for persistent connections
+    alb.ingress.kubernetes.io/load-balancer-attributes: |
+      idle_timeout.timeout_seconds=3600,
+      deletion_protection.enabled=true
+    alb.ingress.kubernetes.io/tags: |
+      Environment=production,
+      Application=postgres-mcp,
+      ManagedBy=kubernetes
+spec:
+  ingressClassName: alb
+  rules:
+    - host: mcp.gabbanext.run
+      http:
+        paths:
+          - path: /postgres-mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: postgres-mcp-service
+                port:
+                  number: 80
+          - path: /db-mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80

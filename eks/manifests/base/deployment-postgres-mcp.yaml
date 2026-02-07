@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-mcp
+  namespace: postgres-mcp
+  labels:
+    app: postgres-mcp
+    app.kubernetes.io/name: postgres-mcp
+    app.kubernetes.io/part-of: topmate-mcp
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: postgres-mcp
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: postgres-mcp
+        app.kubernetes.io/name: postgres-mcp
+    spec:
+      serviceAccountName: postgres-mcp-sa
+      containers:
+        - name: postgres-mcp
+          image: 072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-postgres-mcp:latest
+          ports:
+            - containerPort: 8000
+              protocol: TCP
+          env:
+            - name: DATABASE_URI
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-mcp-secrets
+                  key: database-uri
+            - name: ACCESS_MODE
+              value: "restricted"
+            - name: TRANSPORT
+              value: "sse"
+            - name: PORT
+              value: "8000"
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      terminationGracePeriodSeconds: 30
