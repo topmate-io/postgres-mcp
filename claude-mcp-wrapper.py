@@ -30,30 +30,31 @@ def log(msg):
         pass
 
 def get_auth_token() -> str:
-    """Get gcloud identity token"""
+    """Get gcloud identity token (returns empty string if auth not available)"""
     try:
         token = subprocess.check_output(
             ["gcloud", "auth", "print-identity-token"],
             stderr=subprocess.DEVNULL,
             text=True
         ).strip()
-        if not token:
-            raise RuntimeError("Empty token")
-        log("Got auth token")
-        return token
+        if token:
+            log("Got auth token")
+            return token
+        else:
+            log("No auth token available, proceeding without auth")
+            return ""
     except Exception as e:
-        log(f"Auth failed: {e}")
-        print(f"Error: Unable to authenticate with gcloud: {e}", file=sys.stderr)
-        print("Run: gcloud auth application-default login", file=sys.stderr)
-        sys.exit(1)
+        log(f"Auth not available (proceeding without auth): {e}")
+        return ""
 
 def sse_reader_thread(token: str, base_url: str, session_id: str, output_queue: queue.Queue):
     """Read from SSE endpoint using curl"""
     curl_cmd = [
-        "curl", "-s", "-N", "--no-buffer",
-        "-H", f"Authorization: Bearer {token}",
-        f"{base_url}/sse?session_id={session_id}"
+        "curl", "-s", "-N", "--no-buffer"
     ]
+    if token:
+        curl_cmd.extend(["-H", f"Authorization: Bearer {token}"])
+    curl_cmd.append(f"{base_url}/sse?session_id={session_id}")
 
     try:
         log(f"Starting SSE reader with session {session_id}")
@@ -134,12 +135,15 @@ def send_message_to_server(token: str, base_url: str, endpoint_path: str, messag
         full_url = f"{base_url}{endpoint_path}"
         curl_cmd = [
             "curl", "-s", "-L",
-            "-X", "POST",
-            "-H", f"Authorization: Bearer {token}",
+            "-X", "POST"
+        ]
+        if token:
+            curl_cmd.extend(["-H", f"Authorization: Bearer {token}"])
+        curl_cmd.extend([
             "-H", "Content-Type: application/json",
             "-d", json.dumps(message),
             full_url
-        ]
+        ])
 
         log(f"Sending: method={message.get('method')}")
         result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=5)

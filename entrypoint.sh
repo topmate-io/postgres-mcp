@@ -1,54 +1,71 @@
 #!/bin/bash
-set -e
+# Cloud Run entrypoint with Cloud SQL Proxy v2
 
-echo "=== postgres-mcp Cloud Run Startup ==="
+# Redirect all output (stdout and stderr) to stderr so it appears in Cloud Run logs
+exec 2>&1
+
+echo "=========================================="
+echo "postgres-mcp Cloud Run Startup"
+echo "=========================================="
+echo ""
 
 # Cloud SQL instance in format: PROJECT:REGION:INSTANCE
-CLOUD_SQL_INSTANCE="ds-dev-474406:asia-south1:ds-dev-pg"
+# Note: This is for Cloud SQL proxy; we're using direct PostgreSQL connection instead
+CLOUD_SQL_INSTANCE="ds-share-474010:asia-south1:ds-share-pg"
 
-echo "Starting Cloud SQL Proxy..."
-echo "Cloud SQL Instance: $CLOUD_SQL_INSTANCE"
+echo "Step 1: Starting Cloud SQL Proxy v2..."
+echo "Instance: $CLOUD_SQL_INSTANCE"
+echo "Proxy binary: /cloud-sql-proxy"
+echo "Proxy version info:"
+/cloud-sql-proxy --version 2>&1 || echo "  (version check failed)"
+echo ""
 
-# Start cloud-sql-proxy in background
-# This creates a TCP socket at 127.0.0.1:5432
+# Start cloud-sql-proxy v2 in background
+# Uses Application Default Credentials from service account
+# v2 syntax: proxy [instance-connection-string] --port=PORT --address=ADDR
+echo "Starting: /cloud-sql-proxy $CLOUD_SQL_INSTANCE --port=5432 --address=127.0.0.1"
 /cloud-sql-proxy \
   "$CLOUD_SQL_INSTANCE" \
   --port=5432 \
-  --ip=127.0.0.1 &
+  --address=127.0.0.1 > /tmp/proxy.log 2>&1 &
 
 PROXY_PID=$!
-echo "✓ Cloud SQL Proxy started with PID $PROXY_PID"
+echo "✓ Cloud SQL Proxy started (PID: $PROXY_PID)"
+echo ""
 
-# Wait for proxy to be ready (give it time to establish connection)
-echo "Waiting for Cloud SQL Proxy to be ready..."
-sleep 10
+# Give proxy time to initialize
+echo "Waiting 15 seconds for proxy to be ready..."
+sleep 15
 
-# Build DATABASE_URI pointing to localhost:5432
-# DATABASE_URI env var contains credentials: postgresql://user:pass@host/database
-# We parse it and rebuild pointing to localhost
-if [ -n "$DATABASE_URI" ]; then
-  # Extract user, password, and database from existing URI
-  DB_USER=$(echo "$DATABASE_URI" | sed -n 's/.*:\/\/\([^:]*\).*/\1/p')
-  DB_PASS=$(echo "$DATABASE_URI" | sed -n 's/.*:\([^@]*\)@.*/\1/p')
-  DB_NAME=$(echo "$DATABASE_URI" | sed -n 's/.*\/\([^?]*\).*/\1/p')
-
-  # Create new URI pointing to localhost proxy
-  export DATABASE_URI="postgresql://${DB_USER}:${DB_PASS}@localhost:5432/${DB_NAME}"
-  echo "✓ DATABASE_URI configured to use Cloud SQL Proxy"
+# Check if proxy is running
+if ps -p $PROXY_PID > /dev/null 2>&1; then
+  echo "✓ Cloud SQL Proxy is still running"
+  echo "Proxy logs:"
+  head -20 /tmp/proxy.log 2>/dev/null || echo "  (no logs available)"
+else
+  echo "✗ Cloud SQL Proxy died! Last logs:"
+  tail -20 /tmp/proxy.log 2>/dev/null || echo "  (no logs available)"
+  sleep 2
 fi
 
-echo "Starting postgres-mcp..."
-echo "Listening on 0.0.0.0:8000"
+echo ""
+echo "Step 2: Configuring DATABASE_URI..."
+# The DATABASE_URI from secret points to localhost:5432 (which proxy listens on)
+if [ -n "$DATABASE_URI" ]; then
+  echo "DATABASE_URI is set (length: ${#DATABASE_URI})"
+  echo "First 70 chars: ${DATABASE_URI:0:70}"
+else
+  echo "WARNING: DATABASE_URI environment variable not set!"
+fi
 
-# Start postgres-mcp in foreground
-python -m postgres_mcp \
+echo ""
+echo "Step 3: Starting postgres-mcp server..."
+echo "Listening on 0.0.0.0:8000"
+echo ""
+
+# Start postgres-mcp - this should now connect via the proxy on localhost:5432
+exec python -m postgres_mcp \
   --transport=sse \
   --sse-host=0.0.0.0 \
   --sse-port=8000 \
-  --access-mode=restricted &
-
-MCP_PID=$!
-echo "✓ postgres-mcp started with PID $MCP_PID"
-
-# Wait for both processes
-wait $PROXY_PID $MCP_PID
+  --access-mode=restricted

@@ -1,0 +1,16 @@
+# Postgres MCP Server for Cloud Run
+# Using official Crystal DBA image
+FROM --platform=linux/amd64 crystaldba/postgres-mcp:latest
+
+# Cloud Run expects the service to listen on $PORT (default 8000)
+ENV PORT=8000
+
+# Database URI will be provided via Cloud Run secrets
+# The image will automatically use DATABASE_URI env var
+
+# Expose port for Cloud Run
+EXPOSE 8000
+
+# Run postgres-mcp in SSE mode with restricted access
+# The entrypoint is already set to postgres-mcp by the base image
+CMD ["--access-mode=restricted", "--transport=sse", "--sse-host=0.0.0.0"]

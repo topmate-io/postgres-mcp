@@ -11,7 +11,18 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Allow traffic from ALB ingress controller
+    # Allow traffic from ALB (IP target type sends health checks from VPC IPs)
+    - from:
+        - ipBlock:
+            cidr: 10.0.0.0/20
+        - ipBlock:
+            cidr: 10.0.16.0/20
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 9000
+    # Allow traffic from kube-system (ingress controller pods)
     - from:
         - namespaceSelector:
             matchLabels:

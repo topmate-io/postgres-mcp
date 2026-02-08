@@ -1,7 +1,5 @@
 # Multi-stage build for Cloud Run with Cloud SQL Proxy
 
-FROM gcr.io/cloudsql-docker/cloud-sql-proxy:1.33.2 AS proxy
-
 FROM python:3.12-slim-bookworm AS builder
 
 WORKDIR /app
@@ -32,16 +30,21 @@ RUN groupadd -r appuser && useradd -r -g appuser appuser
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies and download Cloud SQL Proxy
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     curl \
     tini \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Copy cloud-sql-proxy from first stage
-COPY --from=proxy /cloud_sql_proxy /cloud-sql-proxy
+# Download Cloud SQL Proxy v2 binary (latest stable)
+# Using storage.googleapis.com URL for v2 proxy
+RUN PROXY_VERSION="v2.19.0" && \
+    curl -L -o /cloud-sql-proxy \
+    "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/${PROXY_VERSION}/cloud-sql-proxy.linux.amd64" && \
+    chmod +x /cloud-sql-proxy
 
 # Copy virtual environment and source
 COPY --from=builder /app/.venv /app/.venv
@@ -49,7 +52,11 @@ COPY --from=builder /app/src /app/src
 
 # Copy entrypoint script
 COPY entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && \
+    chown appuser:appuser /app/entrypoint.sh
+
+# Make cloud-sql-proxy accessible to appuser
+RUN chown appuser:appuser /cloud-sql-proxy
 
 # Set environment
 ENV PATH="/app/.venv/bin:$PATH"
@@ -65,5 +72,5 @@ USER appuser
 # Use tini for signal handling
 ENTRYPOINT ["/usr/bin/tini", "--"]
 
-# Run entrypoint script
-CMD ["/app/entrypoint.sh"]
+# Run entrypoint script with bash explicitly to capture output
+CMD ["/bin/bash", "-c", "exec /app/entrypoint.sh"]

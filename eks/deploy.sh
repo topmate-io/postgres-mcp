@@ -19,7 +19,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Configuration
 AWS_ACCOUNT_ID="072528252688"
 AWS_REGION="ap-south-1"
-AWS_PROFILE="072528252688_AWSAdministratorAccess"
+AWS_PROFILE="topmate-prod"
 EKS_CLUSTER="production-topmate-eks"
 NAMESPACE="postgres-mcp"
 ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"

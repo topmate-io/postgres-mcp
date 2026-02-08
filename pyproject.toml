@@ -1,7 +1,7 @@
 [project]
 name = "postgres-mcp"
-version = "0.3.0"
-description = "PostgreSQL Tuning and Analysis Tool"
+version = "0.4.0"
+description = "PostgreSQL Tuning and Analysis Tool with Topmate Business Logic Integration"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

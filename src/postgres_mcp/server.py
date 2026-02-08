@@ -33,6 +33,7 @@ from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
+from .topmate_business_logic import TopmateBuisnessLogic
 from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
 
@@ -59,6 +60,15 @@ class AccessMode(str, Enum):
 db_connection = DbConnPool()
 current_access_mode = AccessMode.UNRESTRICTED
 shutdown_in_progress = False
+
+# Initialize TopmateBuisnessLogic with graceful fallback
+topmate_logic = None
+try:
+    topmate_logic = TopmateBuisnessLogic()
+    logger.info("TopmateBuisnessLogic initialized")
+except Exception as e:
+    logger.warning(f"Could not initialize TopmateBuisnessLogic: {e}")
+    topmate_logic = None
 
 
 async def get_sql_driver() -> Union[SqlDriver, SafeSqlDriver]:
@@ -547,43 +557,138 @@ async def get_topmate_troubleshooting_guide() -> ResponseType:
     return format_text_response(TROUBLESHOOTING_GUIDE)
 
 
-# Add health check endpoints using FastMCP's router
-# These are checked by Kubernetes liveness/readiness probes
-try:
-    @mcp.router.get("/")
-    async def root_health_check():
-        """Root health check endpoint for Kubernetes probes."""
-        try:
-            if db_connection.pool is None:
-                return {"status": "unhealthy"}
+@mcp.tool(
+    name="get_business_logic_patterns",
+    description="Provides comprehensive business logic patterns and SQL query guidance for complex scenarios. "
+    "Fetches from Topmate Logic Hub API (requires TOPMATE_LOGIC_HUB_BASE_URL and TOPMATE_LOGIC_HUB_API_KEY environment variables). "
+    "Returns business logic patterns, rules, and SQL query guidance.",
+)
+async def get_business_logic_patterns() -> ResponseType:
+    """Get business logic patterns and SQL guidance from Topmate Logic Hub.
 
-            # Quick database connectivity check
-            async with db_connection.pool.connection() as conn:
-                await conn.execute("SELECT 1")
+    This tool fetches dynamic patterns from the external Topmate Logic Hub API
+    when TOPMATE_LOGIC_HUB credentials are configured.
+    """
+    if topmate_logic is None:
+        return format_error_response(
+            "TopmateBuisnessLogic service not available. Please check that TOPMATE_LOGIC_HUB_BASE_URL and TOPMATE_LOGIC_HUB_API_KEY environment variables are set."
+        )
 
-            return {"status": "healthy"}
-        except Exception as e:
-            logger.debug(f"Root health check failed: {e}")
-            # Still return 200 if server is up, even if DB check fails
-            return {"status": "up"}
+    try:
+        rules = topmate_logic.get_rules()
+        patterns = topmate_logic.get_patterns()
+        return format_text_response(
+            {
+                "description": "Business logic patterns for complex SQL queries",
+                "basic_rules": [rule.get("description") for rule in rules] if isinstance(rules, list) else rules,
+                "patterns": {p.get("pattern_name"): p.get("pattern_data") for p in patterns} if isinstance(patterns, list) else patterns,
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error getting business logic patterns: {e}")
+        return format_error_response(str(e))
 
-    @mcp.router.get("/health")
-    async def health_check_endpoint():
-        """Detailed health check endpoint."""
-        try:
-            if db_connection.pool is None:
-                return {"status": "unhealthy", "reason": "Database pool not ready"}
 
-            # Quick database connectivity check
-            async with db_connection.pool.connection() as conn:
-                await conn.execute("SELECT 1")
+# Add health check middleware for load balancers
+# FastMCP is an MCP protocol server, not HTTP, so we need ASGI middleware
+# to handle health check requests from load balancers
 
-            return {"status": "healthy"}
-        except Exception as e:
-            logger.debug(f"Health check failed: {e}")
-            return {"status": "unhealthy", "reason": str(e)}
-except (AttributeError, RuntimeError) as e:
-    logger.warning(f"Could not add health endpoints via mcp.router: {e}")
+
+class HealthCheckMiddleware:
+    """ASGI middleware to handle health checks and strip path prefixes.
+
+    ALB ingress forwards requests with the full path (e.g. /postgres-mcp/sse).
+    This middleware strips known prefixes so FastMCP sees the expected paths.
+    """
+
+    PATH_PREFIXES = ("/postgres-mcp", "/db-mcp")
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "")
+            method = scope.get("method", "")
+
+            # Strip ALB ingress path prefix before any routing
+            for prefix in self.PATH_PREFIXES:
+                if path.startswith(prefix):
+                    path = path[len(prefix):] or "/"
+                    scope = dict(scope, path=path)
+                    break
+
+            # Simple health check for root path
+            if method == "GET" and path == "/":
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"cache-control", b"no-store"],
+                        ],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"status":"ok"}',
+                    }
+                )
+                return
+
+            # Health endpoint with database check
+            if method == "GET" and path == "/health":
+                try:
+                    if db_connection.pool is None:
+                        status_code = 503
+                        body = b'{"status":"unhealthy","reason":"Database pool not ready"}'
+                    else:
+                        # Quick database connectivity check
+                        async with db_connection.pool.connection() as conn:
+                            await conn.execute("SELECT 1")
+                        status_code = 200
+                        body = b'{"status":"healthy"}'
+                except Exception as e:
+                    logger.debug(f"Health check failed: {e}")
+                    status_code = 503
+                    body = f'{{"status":"unhealthy","reason":"{str(e)}"}}'.encode()
+
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status_code,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"cache-control", b"no-store"],
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            # Kubernetes liveness probe
+            if method == "GET" and path == "/healthz":
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 200,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                        ],
+                    }
+                )
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b'{"alive":true}',
+                    }
+                )
+                return
+
+        # Pass through to FastMCP app (with stripped path)
+        await self.app(scope, receive, send)
 
 
 async def main():
@@ -676,7 +781,22 @@ async def main():
             enable_dns_rebinding_protection=False
         )
 
-        await mcp.run_sse_async()
+        # Wrap the FastMCP SSE app with health check middleware
+        # This intercepts /health, /healthz, / before they reach FastMCP
+        import uvicorn
+
+        starlette_app = mcp.sse_app()
+        wrapped_app = HealthCheckMiddleware(starlette_app)
+        logger.info("Applied HealthCheckMiddleware to FastMCP SSE app")
+
+        config = uvicorn.Config(
+            wrapped_app,
+            host=mcp.settings.host,
+            port=mcp.settings.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
 
 
 async def shutdown(sig=None):
