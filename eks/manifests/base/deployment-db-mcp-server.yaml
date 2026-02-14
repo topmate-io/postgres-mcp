@@ -43,6 +43,8 @@ spec:
                   key: logic-hub-api-key
             - name: PORT
               value: "9000"
+            - name: ALLOWED_IPS
+              value: "157.20.14.22"
           resources:
             requests:
               memory: "128Mi"

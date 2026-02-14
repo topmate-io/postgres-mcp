@@ -1,6 +1,7 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import ipaddress
 import logging
 import os
 import signal
@@ -594,6 +595,89 @@ async def get_business_logic_patterns() -> ResponseType:
 # to handle health check requests from load balancers
 
 
+class IPAllowlistMiddleware:
+    """ASGI middleware that restricts access to allowed IPs/CIDRs.
+
+    Reads comma-separated IPs/CIDRs from the ALLOWED_IPS env var.
+    Health check paths are always exempt so ALB probes continue working.
+    If ALLOWED_IPS is empty or unset, all traffic is allowed (backwards compatible).
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+        self.allowed_networks = self._load_allowed_ips()
+
+    def _load_allowed_ips(self):
+        raw = os.getenv("ALLOWED_IPS", "").strip()
+        if not raw:
+            return None  # None = allow all
+        networks = []
+        for entry in raw.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            if "/" not in entry:
+                entry += "/32"  # Single IP -> /32 CIDR
+            networks.append(ipaddress.ip_network(entry, strict=False))
+        if networks:
+            logger.info(f"IP allowlist loaded: {[str(n) for n in networks]}")
+        return networks if networks else None
+
+    def _get_client_ip(self, scope, headers):
+        # ALB sets X-Forwarded-For: <client>, <proxy1>, ...
+        xff = headers.get(b"x-forwarded-for")
+        if xff:
+            return xff.decode("latin-1").split(",")[0].strip()
+        # Fallback to ASGI client
+        client = scope.get("client")
+        return client[0] if client else None
+
+    def _is_allowed(self, ip_str):
+        if self.allowed_networks is None:
+            return True
+        if not ip_str:
+            return False
+        try:
+            addr = ipaddress.ip_address(ip_str)
+            return any(addr in net for net in self.allowed_networks)
+        except ValueError:
+            return False
+
+    def _get_path(self, scope):
+        """Get the request path, stripping known ALB prefixes."""
+        path = scope.get("path", "")
+        for prefix in ("/postgres-mcp", "/db-mcp"):
+            if path.startswith(prefix):
+                return path[len(prefix):] or "/"
+        return path
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and self.allowed_networks is not None:
+            path = self._get_path(scope)
+
+            # Always allow health check paths (ALB probes)
+            if path not in self.HEALTH_PATHS:
+                headers = dict(scope.get("headers", []))
+                client_ip = self._get_client_ip(scope, headers)
+
+                if not self._is_allowed(client_ip):
+                    logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
+                    await send({
+                        "type": "http.response.start",
+                        "status": 403,
+                        "headers": [[b"content-type", b"application/json"]],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": b'{"error":"forbidden","message":"IP not allowed"}',
+                    })
+                    return
+
+        await self.app(scope, receive, send)
+
+
 class HealthCheckMiddleware:
     """ASGI middleware to handle health checks and strip path prefixes.
 
@@ -612,10 +696,11 @@ class HealthCheckMiddleware:
             method = scope.get("method", "")
 
             # Strip ALB ingress path prefix before any routing
+            # Set root_path so SSE transport includes the prefix in endpoint URLs
             for prefix in self.PATH_PREFIXES:
                 if path.startswith(prefix):
                     path = path[len(prefix):] or "/"
-                    scope = dict(scope, path=path)
+                    scope = dict(scope, path=path, root_path=prefix)
                     break
 
             # Simple health check for root path
@@ -705,9 +790,9 @@ async def main():
     parser.add_argument(
         "--transport",
         type=str,
-        choices=["stdio", "sse"],
+        choices=["stdio", "sse", "streamable-http"],
         default="stdio",
-        help="Select MCP transport: stdio (default) or sse",
+        help="Select MCP transport: stdio (default), sse, or streamable-http",
     )
     parser.add_argument(
         "--sse-host",
@@ -781,13 +866,26 @@ async def main():
             enable_dns_rebinding_protection=False
         )
 
-        # Wrap the FastMCP SSE app with health check middleware
-        # This intercepts /health, /healthz, / before they reach FastMCP
         import uvicorn
+        from starlette.applications import Starlette
+        from starlette.routing import Route, Mount
 
-        starlette_app = mcp.sse_app()
-        wrapped_app = HealthCheckMiddleware(starlette_app)
-        logger.info("Applied HealthCheckMiddleware to FastMCP SSE app")
+        # Expose both SSE and Streamable HTTP transports
+        # SSE at /sse + /messages (for Claude Code's type:"sse" config)
+        # Streamable HTTP at /mcp (for newer MCP clients)
+        sse_app = mcp.sse_app()
+        http_app = mcp.streamable_http_app()
+
+        async def route_by_transport(scope, receive, send):
+            """Route to SSE or Streamable HTTP based on path."""
+            path = scope.get("path", "")
+            if path == "/mcp" or path.startswith("/mcp/"):
+                await http_app(scope, receive, send)
+            else:
+                await sse_app(scope, receive, send)
+
+        wrapped_app = IPAllowlistMiddleware(HealthCheckMiddleware(route_by_transport))
+        logger.info("Applied IPAllowlistMiddleware + HealthCheckMiddleware with dual transport (SSE + Streamable HTTP)")
 
         config = uvicorn.Config(
             wrapped_app,

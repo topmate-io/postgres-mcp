@@ -8,7 +8,9 @@ metadata:
     app.kubernetes.io/name: postgres-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  replicas: 2
+  # Single replica: SSE sessions are in-memory, multi-replica requires
+  # shared session store or sticky sessions (ALB lb_cookie + client cookie support)
+  replicas: 1
   selector:
     matchLabels:
       app: postgres-mcp
@@ -27,6 +29,11 @@ spec:
       containers:
         - name: postgres-mcp
           image: 072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-postgres-mcp:latest
+          args:
+            - "--transport=sse"
+            - "--sse-host=0.0.0.0"
+            - "--sse-port=8000"
+            - "--access-mode=restricted"
           ports:
             - containerPort: 8000
               protocol: TCP
@@ -42,6 +49,8 @@ spec:
               value: "sse"
             - name: PORT
               value: "8000"
+            - name: ALLOWED_IPS
+              value: "157.20.14.22"
           resources:
             requests:
               memory: "256Mi"
