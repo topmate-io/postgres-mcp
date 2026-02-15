@@ -625,11 +625,11 @@ class IPAllowlistMiddleware:
             logger.info(f"IP allowlist loaded: {[str(n) for n in networks]}")
         return networks if networks else None
 
-    def _get_client_ip(self, scope, headers):
-        # ALB sets X-Forwarded-For: <client>, <proxy1>, ...
-        xff = headers.get(b"x-forwarded-for")
-        if xff:
-            return xff.decode("latin-1").split(",")[0].strip()
+    def _get_client_ip(self, scope):
+        # ASGI headers are list of (name, value) byte tuples
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"x-forwarded-for":
+                return value.decode("latin-1").split(",")[0].strip()
         # Fallback to ASGI client
         client = scope.get("client")
         return client[0] if client else None
@@ -659,8 +659,7 @@ class IPAllowlistMiddleware:
 
             # Always allow health check paths (ALB probes)
             if path not in self.HEALTH_PATHS:
-                headers = dict(scope.get("headers", []))
-                client_ip = self._get_client_ip(scope, headers)
+                client_ip = self._get_client_ip(scope)
 
                 if not self._is_allowed(client_ip):
                     logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")

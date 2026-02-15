@@ -19,6 +19,8 @@ spec:
       maxUnavailable: 0
   template:
     metadata:
+      annotations:
+        karpenter.sh/do-not-disrupt: "true"
       labels:
         app: db-mcp-server
         app.kubernetes.io/name: db-mcp-server
@@ -44,7 +46,7 @@ spec:
             - name: PORT
               value: "9000"
             - name: ALLOWED_IPS
-              value: "157.20.14.22"
+              value: "157.20.14.22,27.7.13.224,101.0.63.155,2402:e280:2109:1f1::/64"
           resources:
             requests:
               memory: "128Mi"

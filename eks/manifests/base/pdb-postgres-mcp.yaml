@@ -1,0 +1,27 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-mcp-pdb
+  namespace: postgres-mcp
+  labels:
+    app: postgres-mcp
+    app.kubernetes.io/part-of: topmate-mcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: postgres-mcp
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: db-mcp-server-pdb
+  namespace: postgres-mcp
+  labels:
+    app: db-mcp-server
+    app.kubernetes.io/part-of: topmate-mcp
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: db-mcp-server

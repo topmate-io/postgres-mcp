@@ -11,6 +11,7 @@ resources:
   - service-postgres-mcp.yaml
   - service-db-mcp-server.yaml
   - hpa-postgres-mcp.yaml
+  - pdb-postgres-mcp.yaml
   - network-policy.yaml
 
 labels:

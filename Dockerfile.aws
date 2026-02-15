@@ -70,4 +70,4 @@ LABEL version="0.4.0"
 
 # Entry point - runs the MCP server with SSE transport for remote access
 ENTRYPOINT ["python", "-m", "postgres_mcp"]
-CMD ["--transport=sse", "--sse-host=0.0.0.0", "--sse-port=8000", "--access-mode=restricted"]
+CMD ["--transport=streamable-http", "--sse-host=0.0.0.0", "--sse-port=8000", "--access-mode=restricted"]
