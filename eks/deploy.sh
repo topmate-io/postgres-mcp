@@ -188,6 +188,99 @@ if [ "$SKIP_SECRETS" = false ]; then
     --dry-run=client -o yaml | kubectl apply -f -
 
   echo "Kubernetes secret postgres-mcp-secrets created/updated."
+
+  # Create topmate-bi-secrets (for BI MCP server: GitHub, GCP, S3, Redis)
+  echo ""
+  echo "Creating topmate-bi-secrets (optional keys)..."
+  echo "  Secrets needed in AWS Secrets Manager (optional):"
+  echo "    - topmate/bi-mcp/github-token"
+  echo "    - topmate/bi-mcp/gcp-project-id"
+  echo "    - topmate/bi-mcp/s3-bucket"
+  echo "    - topmate/bi-mcp/redis-url"
+  echo "    - topmate/bi-mcp/anthropic-api-key (for Claude API)"
+  echo "    - topmate/bi-mcp/openai-api-key (for OpenAI)"
+  echo "    - topmate/bi-mcp/openrouter-api-key (for OpenRouter)"
+  echo ""
+
+  BI_SECRET_ARGS=""
+
+  # GitHub App credentials (preferred over PAT)
+  GITHUB_APP_CREDS=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/github-app-credentials \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && {
+    GITHUB_APP_ID=$(echo "${GITHUB_APP_CREDS}" | python3 -c "import sys,json; print(json.load(sys.stdin)['app_id'])")
+    GITHUB_INSTALL_ID=$(echo "${GITHUB_APP_CREDS}" | python3 -c "import sys,json; print(json.load(sys.stdin)['installation_id'])")
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-id=${GITHUB_APP_ID}"
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-installation-id=${GITHUB_INSTALL_ID}"
+    echo "  Found GitHub App credentials (app_id=${GITHUB_APP_ID}, installation_id=${GITHUB_INSTALL_ID})"
+  } || echo "  WARN: topmate/bi-mcp/github-app-credentials not found"
+
+  GITHUB_APP_PK=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/github-app-private-key \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-private-key=${GITHUB_APP_PK}" || \
+    echo "  WARN: topmate/bi-mcp/github-app-private-key not found"
+
+  GITHUB_WEBHOOK_SEC=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/github-webhook-secret \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-webhook-secret=${GITHUB_WEBHOOK_SEC}" || \
+    echo "  WARN: topmate/bi-mcp/github-webhook-secret not found (webhook signature verification disabled)"
+
+  # PAT fallback
+  GITHUB_TOKEN=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/github-token \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-token=${GITHUB_TOKEN}" || \
+    echo "  WARN: topmate/bi-mcp/github-token not found (GitHub PAT fallback disabled)"
+
+  GCP_PROJECT_ID=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/gcp-project-id \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=gcp-project-id=${GCP_PROJECT_ID}" || \
+    echo "  WARN: topmate/bi-mcp/gcp-project-id not found (Vertex AI will be disabled)"
+
+  S3_BUCKET=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/s3-bucket \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=s3-bucket=${S3_BUCKET}" || \
+    echo "  WARN: topmate/bi-mcp/s3-bucket not found (report uploads disabled)"
+
+  REDIS_URL_BI=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/redis-url \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=redis-url=${REDIS_URL_BI}" || \
+    echo "  WARN: topmate/bi-mcp/redis-url not found (using in-memory cache only)"
+
+  # LLM API keys (only one needed depending on LLM_PROVIDER setting)
+  ANTHROPIC_KEY=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/anthropic-api-key \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=anthropic-api-key=${ANTHROPIC_KEY}" || true
+
+  OPENAI_KEY=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/openai-api-key \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openai-api-key=${OPENAI_KEY}" || true
+
+  OPENROUTER_KEY=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/openrouter-api-key \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openrouter-api-key=${OPENROUTER_KEY}" || true
+
+  if [ -n "${BI_SECRET_ARGS}" ]; then
+    eval kubectl create secret generic topmate-bi-secrets \
+      ${BI_SECRET_ARGS} \
+      -n "${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    echo "Kubernetes secret topmate-bi-secrets created/updated."
+  else
+    echo "  No BI secrets found. Creating empty secret placeholder."
+    kubectl create secret generic topmate-bi-secrets \
+      --from-literal=placeholder="none" \
+      -n "${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  fi
 else
   echo ""
   echo "[5/7] Skipping secrets creation (--skip-secrets)"
@@ -237,6 +330,7 @@ echo "Verify endpoints:"
 echo "  curl http://${ALB_HOST}/postgres-mcp/health"
 echo "  curl -N http://${ALB_HOST}/postgres-mcp/sse"
 echo "  curl http://${ALB_HOST}/db-mcp/health"
+echo "  curl http://${ALB_HOST}/bi-mcp/health"
 echo ""
 echo "Claude Desktop config:"
 echo '  {'
@@ -244,8 +338,8 @@ echo '    "postgres-mcp-aws": {'
 echo '      "command": "curl",'
 echo "      \"args\": [\"-s\", \"-N\", \"http://mcp.gabbanext.run/postgres-mcp/sse\"]"
 echo '    },'
-echo '    "topmate-db-mcp-aws": {'
+echo '    "topmate-bi-mcp": {'
 echo '      "command": "curl",'
-echo "      \"args\": [\"-s\", \"-N\", \"http://mcp.gabbanext.run/db-mcp/sse\"]"
+echo "      \"args\": [\"-s\", \"-N\", \"http://mcp.gabbanext.run/bi-mcp/sse\"]"
 echo '    }'
 echo '  }'

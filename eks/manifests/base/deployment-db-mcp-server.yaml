@@ -5,7 +5,7 @@ metadata:
   namespace: postgres-mcp
   labels:
     app: db-mcp-server
-    app.kubernetes.io/name: db-mcp-server
+    app.kubernetes.io/name: topmate-bi-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
   replicas: 1
@@ -23,16 +23,41 @@ spec:
         karpenter.sh/do-not-disrupt: "true"
       labels:
         app: db-mcp-server
-        app.kubernetes.io/name: db-mcp-server
+        app.kubernetes.io/name: topmate-bi-mcp
     spec:
       serviceAccountName: postgres-mcp-sa
       containers:
-        - name: db-mcp-server
+        - name: topmate-bi-mcp
           image: 072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-db-mcp-server:latest
           ports:
             - containerPort: 9000
               protocol: TCP
           env:
+            # --- Server ---
+            - name: PORT
+              value: "9000"
+            - name: TRANSPORT
+              value: "sse"
+            - name: LOG_LEVEL
+              value: "INFO"
+            # --- LLM Provider (switch via this env var) ---
+            - name: LLM_PROVIDER
+              value: "vertex_ai"
+            - name: ENABLE_CLARIFICATION
+              value: "true"
+            # --- Postgres MCP (primary: topmate-db-prod-replica) ---
+            - name: POSTGRES_MCP_URL
+              value: "http://postgres-mcp-service.postgres-mcp.svc:80/postgres-mcp"
+            - name: POSTGRES_MCP_TRANSPORT
+              value: "streamable_http"
+            # --- Additional databases (optional - set URLs when postgres-mcp pods are deployed for each) ---
+            # - name: POSTGRES_MCP_KINGSMEAD_URL
+            #   value: "http://kingsmead-mcp-service.postgres-mcp.svc:80/kingsmead-mcp"
+            # - name: POSTGRES_MCP_AUTODM_URL
+            #   value: "http://autodm-mcp-service.postgres-mcp.svc:80/autodm-mcp"
+            # - name: POSTGRES_MCP_WEBSITE_BUILDER_URL
+            #   value: "http://website-builder-mcp-service.postgres-mcp.svc:80/website-builder-mcp"
+            # --- Logic Hub ---
             - name: TOPMATE_LOGIC_HUB_BASE_URL
               valueFrom:
                 secretKeyRef:
@@ -43,31 +68,110 @@ spec:
                 secretKeyRef:
                   name: postgres-mcp-secrets
                   key: logic-hub-api-key
-            - name: PORT
-              value: "9000"
+            # --- GitHub App Auth ---
+            - name: GITHUB_APP_ID
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: github-app-id
+                  optional: true
+            - name: GITHUB_APP_INSTALLATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: github-app-installation-id
+                  optional: true
+            - name: GITHUB_APP_PRIVATE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: github-app-private-key
+                  optional: true
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: github-token
+                  optional: true
+            - name: GITHUB_ORG
+              value: "topmate-io"
+            # --- GitHub Webhooks ---
+            - name: GITHUB_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: github-webhook-secret
+                  optional: true
+            # --- Vertex AI ---
+            - name: GCP_PROJECT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: gcp-project-id
+                  optional: true
+            - name: GCP_LOCATION
+              value: "us-central1"
+            # --- Anthropic (when switching to Claude API) ---
+            # - name: ANTHROPIC_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: topmate-bi-secrets
+            #       key: anthropic-api-key
+            #       optional: true
+            # --- OpenAI (when switching to OpenAI) ---
+            # - name: OPENAI_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: topmate-bi-secrets
+            #       key: openai-api-key
+            #       optional: true
+            # --- OpenRouter (when switching to OpenRouter) ---
+            # - name: OPENROUTER_API_KEY
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: topmate-bi-secrets
+            #       key: openrouter-api-key
+            #       optional: true
+            # --- AWS S3 ---
+            - name: S3_BUCKET
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: s3-bucket
+                  optional: true
+            - name: S3_REGION
+              value: "ap-south-1"
+            # --- Redis (optional) ---
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: redis-url
+                  optional: true
+            # --- Security ---
             - name: ALLOWED_IPS
               value: "157.20.14.22,27.7.13.224,101.0.63.155,2402:e280:2109:1f1::/64"
           resources:
             requests:
-              memory: "128Mi"
-              cpu: "50m"
-            limits:
-              memory: "256Mi"
+              memory: "512Mi"
               cpu: "200m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
           livenessProbe:
             httpGet:
-              path: /health
+              path: /healthz
               port: 9000
-            initialDelaySeconds: 15
+            initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
             httpGet:
-              path: /
+              path: /health
               port: 9000
-            initialDelaySeconds: 10
+            initialDelaySeconds: 15
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 60
