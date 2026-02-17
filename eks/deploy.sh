@@ -215,10 +215,16 @@ if [ "$SKIP_SECRETS" = false ]; then
     echo "  Found GitHub App credentials (app_id=${GITHUB_APP_ID}, installation_id=${GITHUB_INSTALL_ID})"
   } || echo "  WARN: topmate/bi-mcp/github-app-credentials not found"
 
-  GITHUB_APP_PK=$(aws secretsmanager get-secret-value \
+  # Private key: write to temp file (PEM has newlines that break --from-literal)
+  BI_SECRET_FILE_ARGS=""
+  TMPDIR_SECRETS=$(mktemp -d)
+  trap "rm -rf ${TMPDIR_SECRETS}" EXIT
+
+  aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/github-app-private-key \
-    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-private-key=${GITHUB_APP_PK}" || \
+    --query SecretString --output text --region "${AWS_REGION}" \
+    > "${TMPDIR_SECRETS}/github-app-private-key" 2>/dev/null && \
+    BI_SECRET_FILE_ARGS="${BI_SECRET_FILE_ARGS} --from-file=github-app-private-key=${TMPDIR_SECRETS}/github-app-private-key" || \
     echo "  WARN: topmate/bi-mcp/github-app-private-key not found"
 
   GITHUB_WEBHOOK_SEC=$(aws secretsmanager get-secret-value \
@@ -268,9 +274,10 @@ if [ "$SKIP_SECRETS" = false ]; then
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
     BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openrouter-api-key=${OPENROUTER_KEY}" || true
 
-  if [ -n "${BI_SECRET_ARGS}" ]; then
+  if [ -n "${BI_SECRET_ARGS}" ] || [ -n "${BI_SECRET_FILE_ARGS}" ]; then
     eval kubectl create secret generic topmate-bi-secrets \
       ${BI_SECRET_ARGS} \
+      ${BI_SECRET_FILE_ARGS} \
       -n "${NAMESPACE}" \
       --dry-run=client -o yaml | kubectl apply -f -
     echo "Kubernetes secret topmate-bi-secrets created/updated."
