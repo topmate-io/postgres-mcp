@@ -6,6 +6,9 @@ metadata:
   annotations:
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
+    # TLS is terminated at Cloudflare (Client → HTTPS → CF → HTTP → ALB → Pod).
+    # ALB listens on HTTP:80 because Cloudflare sends HTTP to the origin.
+    # Direct ALB access is prevented by Cloudflare proxy + IP allowlist middleware.
     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
@@ -37,6 +40,43 @@ spec:
                 port:
                   number: 80
           - path: /db-mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80
+          - path: /bi-mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80
+          # OAuth 2.1 root-level paths (RFC 8414 discovery + endpoints)
+          # Claude.ai constructs these at the root, not under /db-mcp
+          - path: /.well-known
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80
+          - path: /authorize
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80
+          - path: /token
+            pathType: Prefix
+            backend:
+              service:
+                name: db-mcp-server-service
+                port:
+                  number: 80
+          - path: /register
             pathType: Prefix
             backend:
               service:

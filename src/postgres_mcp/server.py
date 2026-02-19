@@ -89,9 +89,29 @@ def format_text_response(text: Any) -> ResponseType:
     return [types.TextContent(type="text", text=str(text))]
 
 
+def _sanitize_error(error: str) -> str:
+    """Map internal errors to user-friendly messages."""
+    e_lower = error.lower()
+    if any(k in e_lower for k in ("connect", "refused", "resolve", "network", "timeout expired")):
+        return "Database temporarily unavailable. Please try again in a moment."
+    if "timeout" in e_lower or "cancel" in e_lower:
+        return "Query took too long. Try a more specific query with filters or a LIMIT clause."
+    if "syntax" in e_lower:
+        return "Invalid query syntax. Please check your SQL."
+    if "permission" in e_lower or "denied" in e_lower:
+        return "Permission denied for this operation."
+    if "does not exist" in e_lower:
+        return f"Object not found: {error.split('does not exist')[0].strip().split()[-1] if 'does not exist' in error else 'unknown'}"
+    if "duplicate" in e_lower:
+        return "Duplicate entry — this record already exists."
+    # Generic fallback — don't leak internals
+    logger.debug("Sanitized error (original): %s", error)
+    return "An unexpected error occurred. Please try again or refine your query."
+
+
 def format_error_response(error: str) -> ResponseType:
-    """Format an error response."""
-    return format_text_response(f"Error: {error}")
+    """Format a user-friendly error response (sanitized)."""
+    return format_text_response(f"Error: {_sanitize_error(error)}")
 
 
 @mcp.tool(description="List all schemas in the database")
@@ -576,8 +596,8 @@ async def get_business_logic_patterns() -> ResponseType:
         )
 
     try:
-        rules = topmate_logic.get_rules()
-        patterns = topmate_logic.get_patterns()
+        rules = await topmate_logic.get_rules()
+        patterns = await topmate_logic.get_patterns()
         return format_text_response(
             {
                 "description": "Business logic patterns for complex SQL queries",
@@ -593,6 +613,136 @@ async def get_business_logic_patterns() -> ResponseType:
 # Add health check middleware for load balancers
 # FastMCP is an MCP protocol server, not HTTP, so we need ASGI middleware
 # to handle health check requests from load balancers
+
+
+class BearerTokenMiddleware:
+    """ASGI middleware that requires a Bearer token for non-health-check requests.
+
+    Reads the expected token from the AUTH_TOKEN env var.
+    If AUTH_TOKEN is empty/unset, all traffic is allowed (backwards compatible).
+    Health check paths are always exempt.
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+        self._token = os.getenv("AUTH_TOKEN", "").strip()
+
+    def _get_path(self, scope):
+        path = scope.get("path", "")
+        for prefix in ("/postgres-mcp", "/db-mcp"):
+            if path.startswith(prefix):
+                return path[len(prefix):] or "/"
+        return path
+
+    async def __call__(self, scope, receive, send):
+        if not self._token or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = self._get_path(scope)
+        if path in self.HEALTH_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        # Check Authorization header
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        auth = headers.get(b"authorization", b"").decode("latin-1")
+        if auth == f"Bearer {self._token}":
+            await self.app(scope, receive, send)
+            return
+
+        logger.warning("Rejected request: invalid or missing Bearer token (path=%s)", scope.get("path", ""))
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                [b"content-type", b"application/json"],
+                [b"www-authenticate", b"Bearer"],
+            ],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": b'{"error":"unauthorized","message":"Valid Bearer token required"}',
+        })
+
+
+class RateLimiterMiddleware:
+    """Per-IP token-bucket rate limiter for postgres-mcp.
+
+    Exempt paths: health checks.
+    If a client exceeds the rate, returns 429 with Retry-After header.
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app, max_requests: int = 30, window_seconds: int = 60):
+        self.app = app
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._buckets: dict[str, list] = {}  # ip -> [tokens, last_refill]
+        self._lock = asyncio.Lock()
+
+    def _get_path(self, scope):
+        path = scope.get("path", "")
+        for prefix in ("/postgres-mcp", "/db-mcp"):
+            if path.startswith(prefix):
+                return path[len(prefix):] or "/"
+        return path
+
+    def _get_client_ip(self, scope):
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        cf_ip = headers.get(b"cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.decode("latin-1").strip()
+        xff = headers.get(b"x-forwarded-for")
+        if xff:
+            return xff.decode("latin-1").split(",")[0].strip()
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    def _consume(self, ip: str) -> bool:
+        import time as _time
+        now = _time.monotonic()
+        bucket = self._buckets.get(ip)
+        if bucket is None:
+            bucket = [float(self.max_requests), now]
+            self._buckets[ip] = bucket
+        tokens, last = bucket
+        elapsed = now - last
+        refill_rate = self.max_requests / self.window_seconds
+        tokens = min(self.max_requests, tokens + elapsed * refill_rate)
+        bucket[1] = now
+        if tokens >= 1.0:
+            bucket[0] = tokens - 1.0
+            return True
+        bucket[0] = tokens
+        return False
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = self._get_path(scope)
+            if path not in self.HEALTH_PATHS:
+                ip = self._get_client_ip(scope)
+                async with self._lock:
+                    allowed = self._consume(ip)
+                if not allowed:
+                    logger.warning("Rate limit exceeded for %s", ip)
+                    await send({
+                        "type": "http.response.start",
+                        "status": 429,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"retry-after", str(self.window_seconds).encode()],
+                        ],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": b'{"error":"too_many_requests","message":"Rate limit exceeded"}',
+                    })
+                    return
+        await self.app(scope, receive, send)
 
 
 class IPAllowlistMiddleware:
@@ -626,10 +776,22 @@ class IPAllowlistMiddleware:
         return networks if networks else None
 
     def _get_client_ip(self, scope):
-        # ASGI headers are list of (name, value) byte tuples
-        for name, value in scope.get("headers", []):
-            if name.lower() == b"x-forwarded-for":
-                return value.decode("latin-1").split(",")[0].strip()
+        """Extract real client IP. Priority: CF-Connecting-IP > X-Forwarded-For[0] > ASGI client.
+
+        Traffic flows: Client → Cloudflare → ALB → Pod.
+        CF-Connecting-IP is set by Cloudflare and cannot be spoofed by the client.
+        X-Forwarded-For[0] is the first (client-set) IP — less trustworthy but
+        works when Cloudflare is not in the path.
+        """
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        # Prefer Cloudflare's trusted header
+        cf_ip = headers.get(b"cf-connecting-ip")
+        if cf_ip:
+            return cf_ip.decode("latin-1").strip()
+        # Fallback to first XFF IP
+        xff = headers.get(b"x-forwarded-for")
+        if xff:
+            return xff.decode("latin-1").split(",")[0].strip()
         # Fallback to ASGI client
         client = scope.get("client")
         return client[0] if client else None
@@ -675,6 +837,75 @@ class IPAllowlistMiddleware:
                     return
 
         await self.app(scope, receive, send)
+
+
+class SSEKeepAliveMiddleware:
+    """ASGI middleware that injects SSE keep-alive pings for long-lived connections.
+
+    Cloud Run and other load balancers terminate idle SSE connections after ~25s.
+    This middleware wraps the SSE endpoint's `send` callable to start a background
+    task that sends SSE comment pings (`:ping\\n\\n`) every `interval` seconds,
+    keeping the connection alive through any intermediary proxy.
+    """
+
+    def __init__(self, app, interval: int = 15):
+        self.app = app
+        self.interval = interval
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        # Only apply keep-alive to the SSE event stream endpoint
+        if path != "/sse":
+            await self.app(scope, receive, send)
+            return
+
+        ping_task = None
+        response_started = False
+
+        async def send_wrapper(message):
+            nonlocal ping_task, response_started
+
+            if message["type"] == "http.response.start":
+                response_started = True
+                await send(message)
+                return
+
+            if message["type"] == "http.response.body":
+                # Start pinging after the first body chunk (SSE stream opened)
+                if response_started and ping_task is None and not message.get("more_body", True) is False:
+                    ping_task = asyncio.create_task(self._ping_loop(send))
+                await send(message)
+                return
+
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        finally:
+            if ping_task is not None:
+                ping_task.cancel()
+                try:
+                    await ping_task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _ping_loop(self, send):
+        """Send SSE comment pings at regular intervals."""
+        while True:
+            await asyncio.sleep(self.interval)
+            try:
+                await send({
+                    "type": "http.response.body",
+                    "body": b":ping\n\n",
+                    "more_body": True,
+                })
+            except Exception:
+                # Connection closed, stop pinging
+                break
 
 
 class HealthCheckMiddleware:
@@ -883,14 +1114,32 @@ async def main():
             else:
                 await sse_app(scope, receive, send)
 
-        wrapped_app = IPAllowlistMiddleware(HealthCheckMiddleware(route_by_transport))
-        logger.info("Applied IPAllowlistMiddleware + HealthCheckMiddleware with dual transport (SSE + Streamable HTTP)")
+        # Middleware stack (outermost → innermost):
+        # 1. BearerTokenMiddleware — rejects unauthenticated requests
+        # 2. IPAllowlistMiddleware — restricts to allowed IP ranges
+        # 3. RateLimiterMiddleware — per-IP rate limiting
+        # 4. HealthCheckMiddleware — ALB health probes
+        # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
+        wrapped_app = BearerTokenMiddleware(
+            IPAllowlistMiddleware(
+                RateLimiterMiddleware(
+                    HealthCheckMiddleware(
+                        SSEKeepAliveMiddleware(route_by_transport, interval=15)
+                    ),
+                    max_requests=30,
+                    window_seconds=60,
+                )
+            )
+        )
+        logger.info("Applied middleware stack: BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
 
         config = uvicorn.Config(
             wrapped_app,
             host=mcp.settings.host,
             port=mcp.settings.port,
             log_level=mcp.settings.log_level.lower(),
+            timeout_keep_alive=120,
+            timeout_notify=30,
         )
         server = uvicorn.Server(config)
         await server.serve()
