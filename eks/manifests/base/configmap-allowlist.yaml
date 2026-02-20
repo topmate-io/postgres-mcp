@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-mcp-allowlist
+  namespace: postgres-mcp
+  labels:
+    app.kubernetes.io/part-of: topmate-mcp
+data:
+  # Internal pod/VPC IPs - always allowed
+  # Add external IPs via deploy.sh --allowed-ips or edit this file
+  allowed-ips: "__ALLOWED_IPS__"

@@ -28,7 +28,7 @@ spec:
       serviceAccountName: postgres-mcp-sa
       containers:
         - name: topmate-bi-mcp
-          image: 072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-db-mcp-server:latest
+          image: __AWS_ACCOUNT_ID__.dkr.ecr.ap-south-1.amazonaws.com/topmate-db-mcp-server:__IMAGE_TAG__
           ports:
             - containerPort: 9000
               protocol: TCP
@@ -42,14 +42,16 @@ spec:
               value: "INFO"
             # --- LLM Provider (switch via this env var) ---
             - name: LLM_PROVIDER
-              value: "vertex_ai"
+              value: "openrouter"
             - name: ENABLE_CLARIFICATION
               value: "true"
             # --- Postgres MCP (primary: topmate-db-prod-replica) ---
             - name: POSTGRES_MCP_URL
               value: "http://postgres-mcp-service.postgres-mcp.svc:80/postgres-mcp"
             - name: POSTGRES_MCP_TRANSPORT
-              value: "streamable_http"
+              value: "sse"
+            - name: POSTGRES_MCP_TIMEOUT
+              value: "60"
             # --- Additional databases (optional - set URLs when postgres-mcp pods are deployed for each) ---
             # - name: POSTGRES_MCP_KINGSMEAD_URL
             #   value: "http://kingsmead-mcp-service.postgres-mcp.svc:80/kingsmead-mcp"
@@ -125,13 +127,32 @@ spec:
             #       name: topmate-bi-secrets
             #       key: openai-api-key
             #       optional: true
-            # --- OpenRouter (when switching to OpenRouter) ---
-            # - name: OPENROUTER_API_KEY
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: topmate-bi-secrets
-            #       key: openrouter-api-key
-            #       optional: true
+            # --- OpenRouter ---
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: openrouter-api-key
+                  optional: true
+            # --- AWS Athena (WebEngage events) ---
+            - name: WEBENGAGE_AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: webengage-aws-access-key-id
+                  optional: true
+            - name: WEBENGAGE_AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: webengage-aws-secret-access-key
+                  optional: true
+            - name: ATHENA_REGION
+              value: "ap-south-1"
+            - name: ATHENA_DATABASE
+              value: "webengage-events"
+            - name: ATHENA_WORKGROUP
+              value: "webengage-sql"
             # --- AWS S3 ---
             - name: S3_BUCKET
               valueFrom:
@@ -141,16 +162,54 @@ spec:
                   optional: true
             - name: S3_REGION
               value: "ap-south-1"
-            # --- Redis (optional) ---
-            - name: REDIS_URL
+            - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
                   name: topmate-bi-secrets
-                  key: redis-url
+                  key: s3-aws-access-key-id
                   optional: true
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: s3-aws-secret-access-key
+                  optional: true
+            # --- Redis (in-cluster) ---
+            - name: REDIS_URL
+              value: "redis://redis-service.postgres-mcp.svc:6379/0"
             # --- Security ---
             - name: ALLOWED_IPS
-              value: "157.20.14.22,27.7.13.224,101.0.63.155,2402:e280:2109:1f1::/64"
+              valueFrom:
+                configMapKeyRef:
+                  name: postgres-mcp-allowlist
+                  key: allowed-ips
+            - name: AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: auth-token
+                  optional: true
+            # --- OAuth 2.1 (Claude.ai Custom Connector) ---
+            - name: OAUTH_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: oauth-client-id
+                  optional: true
+            - name: OAUTH_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: oauth-client-secret
+                  optional: true
+            - name: OAUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: oauth-jwt-secret
+                  optional: true
+            - name: OAUTH_ISSUER
+              value: "https://mcp.gabbanext.run/db-mcp"
           resources:
             requests:
               memory: "512Mi"
@@ -162,7 +221,7 @@ spec:
             httpGet:
               path: /healthz
               port: 9000
-            initialDelaySeconds: 30
+            initialDelaySeconds: 60
             periodSeconds: 15
             timeoutSeconds: 5
             failureThreshold: 3
@@ -170,7 +229,7 @@ spec:
             httpGet:
               path: /health
               port: 9000
-            initialDelaySeconds: 15
+            initialDelaySeconds: 45
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 3

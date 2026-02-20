@@ -2,13 +2,19 @@
 
 import logging
 import os
-import requests
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
 class TopmateBuisnessLogic:
-    """Fetches business logic patterns from external Topmate Logic Hub."""
+    """Fetches business logic patterns from external Topmate Logic Hub.
+
+    Uses httpx.AsyncClient instead of blocking requests.get() to avoid
+    stalling the entire event loop (and all concurrent MCP requests)
+    when the Logic Hub is slow.
+    """
 
     def __init__(self):
         self.base_url = os.getenv("TOPMATE_LOGIC_HUB_BASE_URL")
@@ -19,28 +25,33 @@ class TopmateBuisnessLogic:
             raise ValueError(
                 "TOPMATE_LOGIC_HUB_BASE_URL and TOPMATE_LOGIC_HUB_API_KEY environment variables must be set"
             )
+        self._client = httpx.AsyncClient(timeout=5.0)
 
-    def get_rules(self):
+    async def get_rules(self):
         """Fetch business rules from the Topmate Logic Hub."""
         url = f"{self.base_url}/api/rules/json"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        response = requests.get(url, headers=headers, timeout=5)
+        response = await self._client.get(url, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def get_patterns(self):
+    async def get_patterns(self):
         """Fetch SQL patterns from the Topmate Logic Hub."""
         url = f"{self.base_url}/api/patterns/json"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        response = requests.get(url, headers=headers, timeout=5)
+        response = await self._client.get(url, headers=headers)
         response.raise_for_status()
         return response.json()
+
+    async def close(self):
+        """Close the HTTP client."""
+        await self._client.aclose()
 
 
 # Topmate database schema reference and common query patterns

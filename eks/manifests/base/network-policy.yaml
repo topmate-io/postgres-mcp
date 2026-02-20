@@ -32,10 +32,39 @@ spec:
           port: 8000
         - protocol: TCP
           port: 9000
-    # Allow intra-namespace communication
+    # Allow intra-namespace communication on MCP ports
     - from:
         - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 9000
+    # Allow db-mcp-server -> Redis on port 6379
+    - from:
+        - podSelector:
+            matchLabels:
+              app: db-mcp-server
+      ports:
+        - protocol: TCP
+          port: 6379
   egress:
+    # Allow intra-namespace communication (db-mcp-server -> postgres-mcp on port 8000/9000)
+    - to:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 8000
+        - protocol: TCP
+          port: 9000
+    # Allow db-mcp-server -> Redis on port 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app: redis
+      ports:
+        - protocol: TCP
+          port: 6379
     # Allow DNS resolution
     - to:
         - namespaceSelector: {}
@@ -44,7 +73,7 @@ spec:
           port: 53
         - protocol: TCP
           port: 53
-    # Allow HTTPS to AWS services (Secrets Manager, CloudWatch)
+    # Allow HTTPS to AWS services (Secrets Manager, CloudWatch), GitHub API, Vertex AI
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

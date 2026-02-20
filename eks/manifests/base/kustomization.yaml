@@ -6,11 +6,15 @@ namespace: postgres-mcp
 resources:
   - namespace.yaml
   - service-account.yaml
+  - configmap-allowlist.yaml
   - deployment-postgres-mcp.yaml
   - deployment-db-mcp-server.yaml
+  - deployment-redis.yaml
   - service-postgres-mcp.yaml
   - service-db-mcp-server.yaml
+  - service-redis.yaml
   - hpa-postgres-mcp.yaml
+  - hpa-db-mcp-server.yaml
   - pdb-postgres-mcp.yaml
   - network-policy.yaml
 

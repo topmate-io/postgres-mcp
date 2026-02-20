@@ -30,6 +30,7 @@ DB_MCP_SERVER_IMAGE="${ECR_REGISTRY}/topmate-db-mcp-server"
 SKIP_BUILD=false
 SKIP_TERRAFORM=false
 SKIP_SECRETS=false
+IMAGE_TAG=""  # Set during build; defaults to 'latest' via DEPLOY_IMAGE_TAG when --skip-build
 
 for arg in "$@"; do
   case $arg in
@@ -109,19 +110,20 @@ if [ "$SKIP_BUILD" = false ]; then
 
   echo "Pushed ${POSTGRES_MCP_IMAGE}:${IMAGE_TAG}"
 
-  # Build topmate-db-mcp-server (if Dockerfile exists in repo)
-  if [ -f "${REPO_ROOT}/Dockerfile.db-mcp-server" ]; then
-    echo "Building topmate-db-mcp-server image..."
+  # Build topmate-db-mcp-server from its own repo (sibling directory)
+  DB_MCP_REPO="${REPO_ROOT}/../topmate-db-mcp-server"
+  if [ -d "${DB_MCP_REPO}" ] && [ -f "${DB_MCP_REPO}/Dockerfile" ]; then
+    echo "Building topmate-db-mcp-server image from ${DB_MCP_REPO}..."
     docker buildx build \
       --platform linux/amd64 \
-      -f "${REPO_ROOT}/Dockerfile.db-mcp-server" \
+      -f "${DB_MCP_REPO}/Dockerfile" \
       -t "${DB_MCP_SERVER_IMAGE}:${IMAGE_TAG}" \
       -t "${DB_MCP_SERVER_IMAGE}:latest" \
       --push \
-      "${REPO_ROOT}"
+      "${DB_MCP_REPO}"
     echo "Pushed ${DB_MCP_SERVER_IMAGE}:${IMAGE_TAG}"
   else
-    echo "WARNING: Dockerfile.db-mcp-server not found. Skipping db-mcp-server build."
+    echo "WARNING: topmate-db-mcp-server repo not found at ${DB_MCP_REPO}."
     echo "         Build and push the image separately before deploying."
   fi
 else
@@ -274,6 +276,23 @@ if [ "$SKIP_SECRETS" = false ]; then
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
     BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openrouter-api-key=${OPENROUTER_KEY}" || true
 
+  # OAuth 2.1 secrets (Claude.ai Custom Connector)
+  OAUTH_CLIENT_ID_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/oauth-client-id \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-client-id=${OAUTH_CLIENT_ID_VAL}" || \
+    echo "  WARN: topmate/bi-mcp/oauth-client-id not found (OAuth disabled)"
+
+  OAUTH_CLIENT_SECRET_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/oauth-client-secret \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-client-secret=${OAUTH_CLIENT_SECRET_VAL}" || true
+
+  OAUTH_JWT_SECRET_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/oauth-jwt-secret \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-jwt-secret=${OAUTH_JWT_SECRET_VAL}" || true
+
   if [ -n "${BI_SECRET_ARGS}" ] || [ -n "${BI_SECRET_FILE_ARGS}" ]; then
     eval kubectl create secret generic topmate-bi-secrets \
       ${BI_SECRET_ARGS} \
@@ -294,6 +313,32 @@ else
 fi
 
 # -----------------------------------------------------------------------------
+# Step 5.5: Substitute Placeholders in Manifests
+# -----------------------------------------------------------------------------
+echo ""
+echo "Substituting manifest placeholders..."
+MANIFEST_DIR="${SCRIPT_DIR}/manifests/base"
+
+# Default allowed IPs: VPC + localhost. Override with DEPLOY_ALLOWED_IPS env var.
+ALLOWED_IPS="${DEPLOY_ALLOWED_IPS:-10.0.0.0/16,127.0.0.1,::1}"
+
+# IMAGE_TAG may not be set if --skip-build was used
+DEPLOY_IMAGE_TAG="${IMAGE_TAG:-latest}"
+
+for f in "${MANIFEST_DIR}"/*.yaml; do
+  sed -i.bak \
+    -e "s|__AWS_ACCOUNT_ID__|${AWS_ACCOUNT_ID}|g" \
+    -e "s|__IMAGE_TAG__|${DEPLOY_IMAGE_TAG}|g" \
+    -e "s|__ALLOWED_IPS__|${ALLOWED_IPS}|g" \
+    "$f"
+done
+# Clean up .bak files (macOS sed creates them with -i.bak)
+rm -f "${MANIFEST_DIR}"/*.yaml.bak
+
+# Ensure placeholders are restored even if kubectl fails (set -e exit)
+trap 'echo "Restoring manifest placeholders..."; git -C "${REPO_ROOT}" checkout -- "${MANIFEST_DIR}"/*.yaml 2>/dev/null || true' EXIT
+
+# -----------------------------------------------------------------------------
 # Step 6: Apply Kustomize Manifests
 # -----------------------------------------------------------------------------
 echo ""
@@ -306,11 +351,16 @@ kubectl apply -k "${SCRIPT_DIR}/manifests/overlays/production"
 echo ""
 echo "[7/7] Waiting for deployments to roll out..."
 
+echo "Waiting for redis deployment..."
+kubectl rollout status deployment/redis -n "${NAMESPACE}" --timeout=120s
+
 echo "Waiting for postgres-mcp deployment..."
 kubectl rollout status deployment/postgres-mcp -n "${NAMESPACE}" --timeout=300s
 
 echo "Waiting for db-mcp-server deployment..."
 kubectl rollout status deployment/db-mcp-server -n "${NAMESPACE}" --timeout=300s
+
+# Restore is handled by EXIT trap (set after sed substitution)
 
 # -----------------------------------------------------------------------------
 # Verification
