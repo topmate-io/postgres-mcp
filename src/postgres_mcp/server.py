@@ -1,11 +1,13 @@
 # ruff: noqa: B008
 import argparse
 import asyncio
+import contextvars
 import ipaddress
 import logging
 import os
 import signal
 import sys
+import uuid
 from enum import Enum
 from typing import Any
 from typing import List
@@ -615,6 +617,58 @@ async def get_business_logic_patterns() -> ResponseType:
 # to handle health check requests from load balancers
 
 
+# ---------------------------------------------------------------------------
+# Request correlation ID
+# ---------------------------------------------------------------------------
+
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="")
+
+
+class RequestIDLogFilter(logging.Filter):
+    """Inject the current request_id into every log record."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_var.get("")  # type: ignore[attr-defined]
+        return True
+
+
+class RequestIDMiddleware:
+    """ASGI middleware that assigns a correlation ID to every HTTP request.
+
+    * Reads ``X-Request-ID`` from the incoming request, or generates a UUID4.
+    * Stores the ID in a ``contextvars.ContextVar`` so loggers can include it.
+    * Injects ``X-Request-ID`` into the response headers for downstream correlation.
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Extract or generate request ID
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        req_id = headers.get(b"x-request-id", b"").decode("latin-1").strip()
+        if not req_id:
+            req_id = uuid.uuid4().hex[:16]
+
+        token = _request_id_var.set(req_id)
+        try:
+            async def send_with_request_id(message):
+                if message["type"] == "http.response.start":
+                    extra = [[b"x-request-id", req_id.encode()]]
+                    message = dict(message, headers=list(message.get("headers", [])) + extra)
+                await send(message)
+
+            await self.app(scope, receive, send_with_request_id)
+        finally:
+            _request_id_var.reset(token)
+
+
 class CORSMiddleware:
     """ASGI middleware that handles CORS preflight and response headers.
 
@@ -1169,26 +1223,32 @@ async def main():
                 await sse_app(scope, receive, send)
 
         # Middleware stack (outermost → innermost):
-        # 0. CORSMiddleware — handles OPTIONS preflight + CORS headers
-        # 1. BearerTokenMiddleware — rejects unauthenticated requests
-        # 2. IPAllowlistMiddleware — restricts to allowed IP ranges
-        # 3. RateLimiterMiddleware — per-IP rate limiting
-        # 4. HealthCheckMiddleware — ALB health probes
-        # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
-        wrapped_app = CORSMiddleware(
-            BearerTokenMiddleware(
-                IPAllowlistMiddleware(
-                    RateLimiterMiddleware(
-                        HealthCheckMiddleware(
-                            SSEKeepAliveMiddleware(route_by_transport, interval=15)
-                        ),
-                        max_requests=30,
-                        window_seconds=60,
+        # 0. RequestIDMiddleware — assigns correlation ID to every request
+        # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
+        # 2. BearerTokenMiddleware — rejects unauthenticated requests
+        # 3. IPAllowlistMiddleware — restricts to allowed IP ranges
+        # 4. RateLimiterMiddleware — per-IP rate limiting
+        # 5. HealthCheckMiddleware — ALB health probes
+        # 6. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
+        wrapped_app = RequestIDMiddleware(
+            CORSMiddleware(
+                BearerTokenMiddleware(
+                    IPAllowlistMiddleware(
+                        RateLimiterMiddleware(
+                            HealthCheckMiddleware(
+                                SSEKeepAliveMiddleware(route_by_transport, interval=15)
+                            ),
+                            max_requests=30,
+                            window_seconds=60,
+                        )
                     )
                 )
             )
         )
-        logger.info("Applied middleware stack: CORS + BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
+        logger.info("Applied middleware stack: RequestID + CORS + BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
+
+        # Attach request-ID filter to root logger so all log records include it
+        logging.getLogger().addFilter(RequestIDLogFilter())
 
         config = uvicorn.Config(
             wrapped_app,
