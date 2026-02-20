@@ -11,10 +11,9 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: postgres-mcp
-  # SSE sessions are in-memory; multiple replicas cause session routing issues
-  # with ALB. Keep at 1 until shared session store (Redis) is implemented.
+  # SSE sessions are in-memory; single replica until Redis session store is wired.
   minReplicas: 1
-  maxReplicas: 5
+  maxReplicas: 1
   metrics:
     - type: Resource
       resource:

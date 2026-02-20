@@ -204,7 +204,7 @@ if [ "$SKIP_SECRETS" = false ]; then
   echo "    - topmate/bi-mcp/openrouter-api-key (for OpenRouter)"
   echo ""
 
-  BI_SECRET_ARGS=""
+  BI_SECRET_ARGS=()
 
   # GitHub App credentials (preferred over PAT)
   GITHUB_APP_CREDS=$(aws secretsmanager get-secret-value \
@@ -212,13 +212,13 @@ if [ "$SKIP_SECRETS" = false ]; then
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && {
     GITHUB_APP_ID=$(echo "${GITHUB_APP_CREDS}" | python3 -c "import sys,json; print(json.load(sys.stdin)['app_id'])")
     GITHUB_INSTALL_ID=$(echo "${GITHUB_APP_CREDS}" | python3 -c "import sys,json; print(json.load(sys.stdin)['installation_id'])")
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-id=${GITHUB_APP_ID}"
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-app-installation-id=${GITHUB_INSTALL_ID}"
+    BI_SECRET_ARGS+=(--from-literal="github-app-id=${GITHUB_APP_ID}")
+    BI_SECRET_ARGS+=(--from-literal="github-app-installation-id=${GITHUB_INSTALL_ID}")
     echo "  Found GitHub App credentials (app_id=${GITHUB_APP_ID}, installation_id=${GITHUB_INSTALL_ID})"
   } || echo "  WARN: topmate/bi-mcp/github-app-credentials not found"
 
   # Private key: write to temp file (PEM has newlines that break --from-literal)
-  BI_SECRET_FILE_ARGS=""
+  BI_SECRET_FILE_ARGS=()
   TMPDIR_SECRETS=$(mktemp -d)
   trap "rm -rf ${TMPDIR_SECRETS}" EXIT
 
@@ -226,77 +226,84 @@ if [ "$SKIP_SECRETS" = false ]; then
     --secret-id topmate/bi-mcp/github-app-private-key \
     --query SecretString --output text --region "${AWS_REGION}" \
     > "${TMPDIR_SECRETS}/github-app-private-key" 2>/dev/null && \
-    BI_SECRET_FILE_ARGS="${BI_SECRET_FILE_ARGS} --from-file=github-app-private-key=${TMPDIR_SECRETS}/github-app-private-key" || \
+    BI_SECRET_FILE_ARGS+=(--from-file="github-app-private-key=${TMPDIR_SECRETS}/github-app-private-key") || \
     echo "  WARN: topmate/bi-mcp/github-app-private-key not found"
 
   GITHUB_WEBHOOK_SEC=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/github-webhook-secret \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-webhook-secret=${GITHUB_WEBHOOK_SEC}" || \
+    BI_SECRET_ARGS+=(--from-literal="github-webhook-secret=${GITHUB_WEBHOOK_SEC}") || \
     echo "  WARN: topmate/bi-mcp/github-webhook-secret not found (webhook signature verification disabled)"
 
   # PAT fallback
   GITHUB_TOKEN=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/github-token \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=github-token=${GITHUB_TOKEN}" || \
+    BI_SECRET_ARGS+=(--from-literal="github-token=${GITHUB_TOKEN}") || \
     echo "  WARN: topmate/bi-mcp/github-token not found (GitHub PAT fallback disabled)"
 
   GCP_PROJECT_ID=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/gcp-project-id \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=gcp-project-id=${GCP_PROJECT_ID}" || \
+    BI_SECRET_ARGS+=(--from-literal="gcp-project-id=${GCP_PROJECT_ID}") || \
     echo "  WARN: topmate/bi-mcp/gcp-project-id not found (Vertex AI will be disabled)"
 
   S3_BUCKET=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/s3-bucket \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=s3-bucket=${S3_BUCKET}" || \
+    BI_SECRET_ARGS+=(--from-literal="s3-bucket=${S3_BUCKET}") || \
     echo "  WARN: topmate/bi-mcp/s3-bucket not found (report uploads disabled)"
 
   REDIS_URL_BI=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/redis-url \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=redis-url=${REDIS_URL_BI}" || \
+    BI_SECRET_ARGS+=(--from-literal="redis-url=${REDIS_URL_BI}") || \
     echo "  WARN: topmate/bi-mcp/redis-url not found (using in-memory cache only)"
 
   # LLM API keys (only one needed depending on LLM_PROVIDER setting)
   ANTHROPIC_KEY=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/anthropic-api-key \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=anthropic-api-key=${ANTHROPIC_KEY}" || true
+    BI_SECRET_ARGS+=(--from-literal="anthropic-api-key=${ANTHROPIC_KEY}") || true
 
   OPENAI_KEY=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/openai-api-key \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openai-api-key=${OPENAI_KEY}" || true
+    BI_SECRET_ARGS+=(--from-literal="openai-api-key=${OPENAI_KEY}") || true
 
   OPENROUTER_KEY=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/openrouter-api-key \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=openrouter-api-key=${OPENROUTER_KEY}" || true
+    BI_SECRET_ARGS+=(--from-literal="openrouter-api-key=${OPENROUTER_KEY}") || true
+
+  # Bearer token auth for db-mcp-server
+  AUTH_TOKEN_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/auth-token \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS+=(--from-literal="auth-token=${AUTH_TOKEN_VAL}") || \
+    echo "  WARN: topmate/bi-mcp/auth-token not found (bearer auth disabled)"
 
   # OAuth 2.1 secrets (Claude.ai Custom Connector)
   OAUTH_CLIENT_ID_VAL=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/oauth-client-id \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-client-id=${OAUTH_CLIENT_ID_VAL}" || \
+    BI_SECRET_ARGS+=(--from-literal="oauth-client-id=${OAUTH_CLIENT_ID_VAL}") || \
     echo "  WARN: topmate/bi-mcp/oauth-client-id not found (OAuth disabled)"
 
   OAUTH_CLIENT_SECRET_VAL=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/oauth-client-secret \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-client-secret=${OAUTH_CLIENT_SECRET_VAL}" || true
+    BI_SECRET_ARGS+=(--from-literal="oauth-client-secret=${OAUTH_CLIENT_SECRET_VAL}") || true
 
   OAUTH_JWT_SECRET_VAL=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/oauth-jwt-secret \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
-    BI_SECRET_ARGS="${BI_SECRET_ARGS} --from-literal=oauth-jwt-secret=${OAUTH_JWT_SECRET_VAL}" || true
+    BI_SECRET_ARGS+=(--from-literal="oauth-jwt-secret=${OAUTH_JWT_SECRET_VAL}") || true
 
-  if [ -n "${BI_SECRET_ARGS}" ] || [ -n "${BI_SECRET_FILE_ARGS}" ]; then
-    eval kubectl create secret generic topmate-bi-secrets \
-      ${BI_SECRET_ARGS} \
-      ${BI_SECRET_FILE_ARGS} \
+  if [ ${#BI_SECRET_ARGS[@]} -gt 0 ] || [ ${#BI_SECRET_FILE_ARGS[@]} -gt 0 ]; then
+    kubectl create secret generic topmate-bi-secrets \
+      "${BI_SECRET_ARGS[@]}" \
+      "${BI_SECRET_FILE_ARGS[@]}" \
       -n "${NAMESPACE}" \
       --dry-run=client -o yaml | kubectl apply -f -
     echo "Kubernetes secret topmate-bi-secrets created/updated."

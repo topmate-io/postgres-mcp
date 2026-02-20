@@ -1011,9 +1011,12 @@ class SSEKeepAliveMiddleware:
                     "body": b":ping\n\n",
                     "more_body": True,
                 })
-            except Exception:
-                # Connection closed, stop pinging
+            except (OSError, BrokenPipeError, ConnectionResetError, RuntimeError):
+                # Connection closed or broken pipe, stop pinging
+                logger.debug("SSE ping loop ended: connection closed")
                 break
+            except asyncio.CancelledError:
+                raise
 
 
 class HealthCheckMiddleware:
