@@ -150,6 +150,8 @@ class ExplainPlanTool:
         """Check if a query contains LIKE expressions, which don't work with GENERIC_PLAN."""
         return bool(re.search(r"\bLIKE\b", query, re.IGNORECASE))
 
+    _ANALYZE_TIMEOUT_MS = 30000  # 30s safety cap for EXPLAIN ANALYZE
+
     async def _run_explain_query(self, query: str, analyze: bool = False, generic_plan: bool = False) -> ExplainPlanArtifact | ErrorResult:
         try:
             explain_options = ["FORMAT JSON"]
@@ -159,6 +161,14 @@ class ExplainPlanTool:
                 explain_options.append("GENERIC_PLAN")
 
             explain_q = f"EXPLAIN ({', '.join(explain_options)}) {query}"
+
+            # Safety: cap execution time for ANALYZE to prevent full-table scans
+            # on the read replica. Uses SET LOCAL so the timeout is transaction-scoped.
+            if analyze:
+                explain_q = (
+                    f"SET LOCAL statement_timeout = '{self._ANALYZE_TIMEOUT_MS}'; "
+                    f"{explain_q}"
+                )
             logger.debug(f"RUNNING EXPLAIN QUERY: {explain_q}")
             rows = await self.sql_driver.execute_query(explain_q)  # type: ignore
             if rows is None:
@@ -176,7 +186,13 @@ class ExplainPlanTool:
                 return ErrorResult(f"Expected dict in EXPLAIN result list, got {type(plan_dict)} with value {plan_dict}")
 
             try:
-                return ExplainPlanArtifact.from_json_data(plan_dict)
+                artifact = ExplainPlanArtifact.from_json_data(plan_dict)
+                if analyze and artifact is not None:
+                    artifact.warnings = getattr(artifact, "warnings", []) or []
+                    artifact.warnings.append(
+                        f"Note: ANALYZE mode has a {self._ANALYZE_TIMEOUT_MS // 1000}s safety timeout to protect the read replica."
+                    )
+                return artifact
             except Exception as e:
                 return ErrorResult(f"Internal error converting explain plan - do not retry: {e}")
         except Exception as e:

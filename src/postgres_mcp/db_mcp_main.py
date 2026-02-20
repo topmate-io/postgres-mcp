@@ -6,7 +6,6 @@ No database connection required - fetches from Topmate Logic Hub API.
 """
 
 import asyncio
-import ipaddress
 import json
 import logging
 import os
@@ -17,7 +16,13 @@ import mcp.types as types
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
-from topmate_buisness_logic import TopmateBuisnessLogic
+from postgres_mcp.server import (
+    BearerTokenMiddleware,
+    IPAllowlistMiddleware,
+    RateLimiterMiddleware,
+    SSEKeepAliveMiddleware,
+)
+from postgres_mcp.topmate_buisness_logic import TopmateBuisnessLogic
 
 # Set up logging
 logging.basicConfig(
@@ -65,8 +70,8 @@ async def get_business_logic_patterns() -> ResponseType:
         )
 
     try:
-        rules = topmate_logic.get_rules()
-        patterns = topmate_logic.get_patterns()
+        rules = await topmate_logic.get_rules()
+        patterns = await topmate_logic.get_patterns()
         return format_text_response(
             {
                 "description": "Business logic patterns for complex SQL queries",
@@ -119,88 +124,6 @@ async def get_sql_troubleshooting_guide() -> ResponseType:
             },
         }
     )
-
-
-class IPAllowlistMiddleware:
-    """ASGI middleware that restricts access to allowed IPs/CIDRs.
-
-    Reads comma-separated IPs/CIDRs from the ALLOWED_IPS env var.
-    Health check paths are always exempt so ALB probes continue working.
-    If ALLOWED_IPS is empty or unset, all traffic is allowed (backwards compatible).
-    """
-
-    HEALTH_PATHS = {"/", "/health", "/healthz"}
-
-    def __init__(self, app):
-        self.app = app
-        self.allowed_networks = self._load_allowed_ips()
-
-    def _load_allowed_ips(self):
-        raw = os.getenv("ALLOWED_IPS", "").strip()
-        if not raw:
-            return None  # None = allow all
-        networks = []
-        for entry in raw.split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            if "/" not in entry:
-                entry += "/32"  # Single IP -> /32 CIDR
-            networks.append(ipaddress.ip_network(entry, strict=False))
-        if networks:
-            logger.info(f"IP allowlist loaded: {[str(n) for n in networks]}")
-        return networks if networks else None
-
-    def _get_client_ip(self, scope):
-        # ASGI headers are list of (name, value) byte tuples
-        for name, value in scope.get("headers", []):
-            if name.lower() == b"x-forwarded-for":
-                return value.decode("latin-1").split(",")[0].strip()
-        # Fallback to ASGI client
-        client = scope.get("client")
-        return client[0] if client else None
-
-    def _is_allowed(self, ip_str):
-        if self.allowed_networks is None:
-            return True
-        if not ip_str:
-            return False
-        try:
-            addr = ipaddress.ip_address(ip_str)
-            return any(addr in net for net in self.allowed_networks)
-        except ValueError:
-            return False
-
-    def _get_path(self, scope):
-        """Get the request path, stripping known ALB prefixes."""
-        path = scope.get("path", "")
-        for prefix in ("/db-mcp",):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and self.allowed_networks is not None:
-            path = self._get_path(scope)
-
-            # Always allow health check paths (ALB probes)
-            if path not in self.HEALTH_PATHS:
-                client_ip = self._get_client_ip(scope)
-
-                if not self._is_allowed(client_ip):
-                    logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
-                    await send({
-                        "type": "http.response.start",
-                        "status": 403,
-                        "headers": [[b"content-type", b"application/json"]],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"forbidden","message":"IP not allowed"}',
-                    })
-                    return
-
-        await self.app(scope, receive, send)
 
 
 class HealthCheckMiddleware:
@@ -292,10 +215,27 @@ async def main():
         else:
             await sse_app(scope, receive, send)
 
-    wrapped_app = IPAllowlistMiddleware(HealthCheckMiddleware(route_by_transport))
-    logger.info("Applied IPAllowlistMiddleware + HealthCheckMiddleware")
+    wrapped_app = BearerTokenMiddleware(
+        IPAllowlistMiddleware(
+            RateLimiterMiddleware(
+                HealthCheckMiddleware(
+                    SSEKeepAliveMiddleware(route_by_transport, interval=15)
+                ),
+                max_requests=30,
+                window_seconds=60,
+            )
+        )
+    )
+    logger.info("Applied BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
 
-    config = uvicorn.Config(wrapped_app, host=host, port=port, log_level="info")
+    config = uvicorn.Config(
+        wrapped_app,
+        host=host,
+        port=port,
+        log_level="info",
+        timeout_keep_alive=120,
+        timeout_notify=30,
+    )
     server = uvicorn.Server(config)
     await server.serve()
 

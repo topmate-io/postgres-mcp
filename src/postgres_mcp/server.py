@@ -615,6 +615,60 @@ async def get_business_logic_patterns() -> ResponseType:
 # to handle health check requests from load balancers
 
 
+class CORSMiddleware:
+    """ASGI middleware that handles CORS preflight and response headers.
+
+    Reads allowed origins from the CORS_ORIGINS env var (comma-separated).
+    If CORS_ORIGINS is empty/unset, CORS handling is disabled (server-to-server only).
+    """
+
+    def __init__(self, app):
+        self.app = app
+        raw = os.getenv("CORS_ORIGINS", "").strip()
+        self.allowed_origins: set[str] = {o.strip() for o in raw.split(",") if o.strip()} if raw else set()
+
+    async def __call__(self, scope, receive, send):
+        if not self.allowed_origins or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers_dict = {name.lower(): value for name, value in scope.get("headers", [])}
+        origin = headers_dict.get(b"origin", b"").decode("latin-1")
+
+        if origin not in self.allowed_origins:
+            # Not a recognised origin — pass through without CORS headers
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+
+        # Preflight
+        if method == "OPTIONS":
+            await send({
+                "type": "http.response.start",
+                "status": 204,
+                "headers": [
+                    [b"access-control-allow-origin", origin.encode()],
+                    [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
+                    [b"access-control-allow-headers", b"Authorization, Content-Type"],
+                    [b"access-control-max-age", b"86400"],
+                ],
+            })
+            await send({"type": "http.response.body", "body": b""})
+            return
+
+        # Normal request — inject CORS headers into the response
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                extra = [
+                    [b"access-control-allow-origin", origin.encode()],
+                ]
+                message = dict(message, headers=list(message.get("headers", [])) + extra)
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
+
 class BearerTokenMiddleware:
     """ASGI middleware that requires a Bearer token for non-health-check requests.
 
@@ -968,7 +1022,7 @@ class HealthCheckMiddleware:
                 except Exception as e:
                     logger.debug(f"Health check failed: {e}")
                     status_code = 503
-                    body = f'{{"status":"unhealthy","reason":"{str(e)}"}}'.encode()
+                    body = b'{"status":"unhealthy","reason":"Database connectivity check failed"}'
 
                 await send(
                     {
@@ -1115,23 +1169,26 @@ async def main():
                 await sse_app(scope, receive, send)
 
         # Middleware stack (outermost → innermost):
+        # 0. CORSMiddleware — handles OPTIONS preflight + CORS headers
         # 1. BearerTokenMiddleware — rejects unauthenticated requests
         # 2. IPAllowlistMiddleware — restricts to allowed IP ranges
         # 3. RateLimiterMiddleware — per-IP rate limiting
         # 4. HealthCheckMiddleware — ALB health probes
         # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
-        wrapped_app = BearerTokenMiddleware(
-            IPAllowlistMiddleware(
-                RateLimiterMiddleware(
-                    HealthCheckMiddleware(
-                        SSEKeepAliveMiddleware(route_by_transport, interval=15)
-                    ),
-                    max_requests=30,
-                    window_seconds=60,
+        wrapped_app = CORSMiddleware(
+            BearerTokenMiddleware(
+                IPAllowlistMiddleware(
+                    RateLimiterMiddleware(
+                        HealthCheckMiddleware(
+                            SSEKeepAliveMiddleware(route_by_transport, interval=15)
+                        ),
+                        max_requests=30,
+                        window_seconds=60,
+                    )
                 )
             )
         )
-        logger.info("Applied middleware stack: BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
+        logger.info("Applied middleware stack: CORS + BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
 
         config = uvicorn.Config(
             wrapped_app,
