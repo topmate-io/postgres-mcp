@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+"""
+PostgreSQL MCP Server Connector (ds-share project)
+Creates a stdio bridge to the Cloud Run MCP service
+"""
+
+import sys
+import json
+import subprocess
+import os
+import signal
+
+def get_auth_token():
+    """Get gcloud identity token"""
+    try:
+        token = subprocess.check_output(
+            ["gcloud", "auth", "print-identity-token"],
+            stderr=subprocess.DEVNULL,
+            text=True
+        ).strip()
+        if not token:
+            raise RuntimeError("Empty token")
+        return token
+    except Exception as e:
+        print(f"Error: Unable to authenticate with gcloud: {e}", file=sys.stderr)
+        print("Run: gcloud auth application-default login", file=sys.stderr)
+        sys.exit(1)
+
+def main():
+    """Main entry point"""
+    token = get_auth_token()
+
+    # Create curl process that connects to the remote MCP service (ds-share production)
+    curl_cmd = [
+        "curl", "-s", "-N",
+        "-H", f"Authorization: Bearer {token}",
+        "https://postgres-mcp-49979260925.asia-south1.run.app/sse"
+    ]
+
+    # Start the curl process
+    try:
+        process = subprocess.Popen(
+            curl_cmd,
+            stdin=sys.stdin,
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+            bufsize=1  # Line buffered for proper streaming
+        )
+
+        # Wait for process to complete
+        process.wait()
+        sys.exit(process.returncode)
+    except KeyboardInterrupt:
+        process.terminate()
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

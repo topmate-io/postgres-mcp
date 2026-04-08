@@ -35,7 +35,13 @@ variable "ecr_repository_name" {
 }
 
 variable "ecr_db_mcp_repository_name" {
-  description = "ECR repository name for the topmate-db-mcp-server image"
+  description = "ECR repository name for the topmate-db-mcp-server (BI MCP) image"
   type        = string
   default     = "topmate-db-mcp-server"
+}
+
+variable "bi_mcp_s3_bucket" {
+  description = "S3 bucket for BI MCP report uploads"
+  type        = string
+  default     = "topmate-bi-reports"
 }

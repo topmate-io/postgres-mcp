@@ -1,19 +1,17 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: postgres-mcp
+  name: postgres-mcp-v2-payment
   namespace: postgres-mcp
   labels:
-    app: postgres-mcp
-    app.kubernetes.io/name: postgres-mcp
+    app: postgres-mcp-v2-payment
+    app.kubernetes.io/name: postgres-mcp-v2-payment
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  # Single replica: SSE sessions are in-memory, multi-replica requires
-  # shared session store or sticky sessions (ALB lb_cookie + client cookie support)
   replicas: 1
   selector:
     matchLabels:
-      app: postgres-mcp
+      app: postgres-mcp-v2-payment
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -24,8 +22,8 @@ spec:
       annotations:
         karpenter.sh/do-not-disrupt: "true"
       labels:
-        app: postgres-mcp
-        app.kubernetes.io/name: postgres-mcp
+        app: postgres-mcp-v2-payment
+        app.kubernetes.io/name: postgres-mcp-v2-payment
     spec:
       serviceAccountName: postgres-mcp-sa
       containers:
@@ -43,24 +41,15 @@ spec:
             - name: DATABASE_URI
               valueFrom:
                 secretKeyRef:
-                  name: postgres-mcp-secrets
-                  key: database-uri
+                  name: postgres-mcp-v2-secrets
+                  key: v2-payment-database-uri
+                  optional: true
             - name: ACCESS_MODE
               value: "restricted"
             - name: TRANSPORT
               value: "sse"
             - name: PORT
               value: "8000"
-            - name: TOPMATE_LOGIC_HUB_BASE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-mcp-secrets
-                  key: logic-hub-url
-            - name: TOPMATE_LOGIC_HUB_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-mcp-secrets
-                  key: logic-hub-api-key
             - name: ALLOWED_IPS
               valueFrom:
                 configMapKeyRef:

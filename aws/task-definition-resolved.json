@@ -1,0 +1,58 @@
+{
+  "family": "topmate-postgres-mcp",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::530511408037:role/ai-interview-ecs-task-execution-role",
+  "taskRoleArn": "arn:aws:iam::530511408037:role/ai-interview-ecs-task-role",
+  "containerDefinitions": [
+    {
+      "name": "topmate-postgres-mcp",
+      "image": "530511408037.dkr.ecr.us-east-1.amazonaws.com/topmate-postgres-mcp:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "hostPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {
+          "name": "PORT",
+          "value": "8000"
+        },
+        {
+          "name": "ACCESS_MODE",
+          "value": "restricted"
+        },
+        {
+          "name": "TRANSPORT",
+          "value": "sse"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "DATABASE_URI",
+          "valueFrom": "arn:aws:secretsmanager:us-east-1:530511408037:secret:topmate/postgres-mcp/database-uri-fAwwns"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/topmate-postgres-mcp",
+          "awslogs-region": "us-east-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/ | grep -qE '404|200' || exit 1"],
+        "interval": 30,
+        "timeout": 15,
+        "retries": 3,
+        "startPeriod": 120
+      }
+    }
+  ]
+}

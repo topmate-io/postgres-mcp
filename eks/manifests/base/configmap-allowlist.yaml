@@ -8,4 +8,4 @@ metadata:
 data:
   # Internal pod/VPC IPs - always allowed
   # Add external IPs via deploy.sh --allowed-ips or edit this file
-  allowed-ips: "__ALLOWED_IPS__"
+  allowed-ips: "10.0.0.0/16,127.0.0.1,::1,157.20.14.22,106.51.68.3,101.0.63.20,2402:e280:2109:1f1:e45c:3f62:ed7:2b51"

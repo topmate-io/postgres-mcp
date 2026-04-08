@@ -739,7 +739,7 @@ class BearerTokenMiddleware:
 
     def _get_path(self, scope):
         path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp"):
+        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
                 return path[len(prefix):] or "/"
         return path
@@ -794,7 +794,7 @@ class RateLimiterMiddleware:
 
     def _get_path(self, scope):
         path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp"):
+        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
                 return path[len(prefix):] or "/"
         return path
@@ -918,7 +918,7 @@ class IPAllowlistMiddleware:
     def _get_path(self, scope):
         """Get the request path, stripping known ALB prefixes."""
         path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp"):
+        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
                 return path[len(prefix):] or "/"
         return path
@@ -1026,7 +1026,7 @@ class HealthCheckMiddleware:
     This middleware strips known prefixes so FastMCP sees the expected paths.
     """
 
-    PATH_PREFIXES = ("/postgres-mcp", "/db-mcp")
+    PATH_PREFIXES = ("/postgres-mcp", "/db-mcp", "/instagram-mcp")
 
     def __init__(self, app):
         self.app = app
@@ -1241,8 +1241,8 @@ async def main():
                             HealthCheckMiddleware(
                                 SSEKeepAliveMiddleware(route_by_transport, interval=15)
                             ),
-                            max_requests=30,
-                            window_seconds=60,
+                            max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                            window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
                         )
                     )
                 )

@@ -1,0 +1,39 @@
+{
+  "serviceName": "topmate-postgres-mcp-service",
+  "cluster": "topmate-mcp-cluster",
+  "taskDefinition": "topmate-postgres-mcp",
+  "desiredCount": 1,
+  "launchType": "FARGATE",
+  "platformVersion": "LATEST",
+  "networkConfiguration": {
+    "awsvpcConfiguration": {
+      "subnets": [
+        "${SUBNET_ID_1}",
+        "${SUBNET_ID_2}"
+      ],
+      "securityGroups": [
+        "${SECURITY_GROUP_ID}"
+      ],
+      "assignPublicIp": "ENABLED"
+    }
+  },
+  "deploymentConfiguration": {
+    "maximumPercent": 200,
+    "minimumHealthyPercent": 100,
+    "deploymentCircuitBreaker": {
+      "enable": true,
+      "rollback": true
+    }
+  },
+  "enableExecuteCommand": true,
+  "tags": [
+    {
+      "key": "Application",
+      "value": "topmate-postgres-mcp"
+    },
+    {
+      "key": "Environment",
+      "value": "production"
+    }
+  ]
+}

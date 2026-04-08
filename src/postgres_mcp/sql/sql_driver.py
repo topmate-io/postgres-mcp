@@ -88,9 +88,11 @@ class DbConnPool:
             # Configure connection pool with appropriate settings
             self.pool = AsyncConnectionPool(
                 conninfo=url,
-                min_size=1,
-                max_size=5,
+                min_size=2,
+                max_size=15,
+                timeout=10.0,  # Raise PoolTimeout after 10s instead of hanging forever
                 open=False,  # Don't connect immediately, let's do it explicitly
+                kwargs={"connect_timeout": 10},  # DB-level connect timeout
             )
 
             # Open the pool explicitly
@@ -212,20 +214,47 @@ class SqlDriver:
                 # Direct connection approach
                 return await self._execute_with_connection(self.conn, query, params, force_readonly=force_readonly)
         except Exception as e:
-            # Mark pool as invalid if there was a connection issue
-            if self.conn and self.is_pool:
-                self.conn._is_valid = False  # type: ignore
-                self.conn._last_error = str(e)  # type: ignore
-            elif self.conn and not self.is_pool:
-                self.conn = None
+            # Only invalidate the pool on connection-fatal errors (network, auth,
+            # pool exhaustion).  Query-level errors (syntax, constraint violation,
+            # cancellation) should NOT invalidate the pool — doing so would break
+            # the service for all concurrent users because of one bad query.
+            _POOL_FATAL = (
+                "OperationalError", "InterfaceError", "ConnectionError",
+                "PoolTimeout", "TooManyConnections",
+            )
+            error_type = type(e).__name__
+            is_fatal = any(ft in error_type for ft in _POOL_FATAL)
+            if is_fatal:
+                if self.conn and self.is_pool:
+                    self.conn._is_valid = False  # type: ignore
+                    self.conn._last_error = str(e)  # type: ignore
+                    logger.warning("Pool invalidated due to fatal error: %s: %s", error_type, e)
+                elif self.conn and not self.is_pool:
+                    self.conn = None
 
             raise e
+
+    # Maximum rows returned from any single query to prevent OOM.
+    # A query returning more rows will be truncated with a warning.
+    MAX_RESULT_ROWS = 2000
+
+    # DB-level statement timeout (ms). Cancels the query on the PostgreSQL
+    # server side — not just the Python coroutine — so the DB connection
+    # stays clean.  Set to 15s for normal queries (SafeSqlDriver adds its
+    # own asyncio timeout on top).
+    STATEMENT_TIMEOUT_MS = 15000
 
     async def _execute_with_connection(self, connection, query, params, force_readonly) -> Optional[List[RowResult]]:
         """Execute query with the given connection."""
         transaction_started = False
         try:
             async with connection.cursor(row_factory=dict_row) as cursor:
+                # Set DB-level statement timeout so long-running queries are
+                # cancelled at the PostgreSQL server side (not just Python).
+                await cursor.execute(
+                    f"SET LOCAL statement_timeout = '{self.STATEMENT_TIMEOUT_MS}'"
+                )
+
                 # Start read-only transaction
                 if force_readonly:
                     await cursor.execute("BEGIN TRANSACTION READ ONLY")
@@ -248,8 +277,17 @@ class SqlDriver:
                         transaction_started = False
                     return None
 
-                # Get results from the last statement only
-                rows = await cursor.fetchall()
+                # Cap result size to prevent OOM on large result sets.
+                # Fetch one extra row to detect truncation.
+                rows = await cursor.fetchmany(self.MAX_RESULT_ROWS + 1)
+                truncated = len(rows) > self.MAX_RESULT_ROWS
+                if truncated:
+                    rows = rows[: self.MAX_RESULT_ROWS]
+                    logger.warning(
+                        "Query result truncated to %d rows (query: %.200s)",
+                        self.MAX_RESULT_ROWS,
+                        query,
+                    )
 
                 # End the transaction appropriately
                 if not force_readonly:
@@ -258,7 +296,14 @@ class SqlDriver:
                     await cursor.execute("ROLLBACK")
                     transaction_started = False
 
-                return [SqlDriver.RowResult(cells=dict(row)) for row in rows]
+                results = [SqlDriver.RowResult(cells=dict(row)) for row in rows]
+                if truncated:
+                    results.append(
+                        SqlDriver.RowResult(
+                            cells={"_warning": f"Results truncated to {self.MAX_RESULT_ROWS} rows. Add a LIMIT clause for better performance."}
+                        )
+                    )
+                return results
 
         except Exception as e:
             # Try to roll back the transaction if it's still active

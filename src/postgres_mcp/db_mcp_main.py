@@ -22,7 +22,7 @@ from postgres_mcp.server import (
     RateLimiterMiddleware,
     SSEKeepAliveMiddleware,
 )
-from postgres_mcp.topmate_buisness_logic import TopmateBuisnessLogic
+from postgres_mcp.topmate_business_logic import TopmateBuisnessLogic
 
 # Set up logging
 logging.basicConfig(
@@ -221,8 +221,8 @@ async def main():
                 HealthCheckMiddleware(
                     SSEKeepAliveMiddleware(route_by_transport, interval=15)
                 ),
-                max_requests=30,
-                window_seconds=60,
+                max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
             )
         )
     )

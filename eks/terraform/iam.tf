@@ -39,7 +39,7 @@ resource "aws_iam_role" "postgres_mcp_sa" {
   }
 }
 
-# Secrets Manager access policy
+# Secrets Manager access policy (postgres-mcp + bi-mcp secrets)
 data "aws_iam_policy_document" "secrets_access" {
   statement {
     effect = "Allow"
@@ -49,8 +49,35 @@ data "aws_iam_policy_document" "secrets_access" {
     ]
     resources = [
       "arn:aws:secretsmanager:${var.region}:${var.aws_account_id}:secret:topmate/postgres-mcp/*",
+      "arn:aws:secretsmanager:${var.region}:${var.aws_account_id}:secret:topmate/bi-mcp/*",
     ]
   }
+}
+
+# S3 access policy for BI MCP report uploads
+data "aws_iam_policy_document" "s3_access" {
+  statement {
+    effect = "Allow"
+    actions = [
+      "s3:PutObject",
+      "s3:GetObject",
+      "s3:ListBucket",
+    ]
+    resources = [
+      "arn:aws:s3:::${var.bi_mcp_s3_bucket}",
+      "arn:aws:s3:::${var.bi_mcp_s3_bucket}/*",
+    ]
+  }
+}
+
+resource "aws_iam_policy" "s3_access" {
+  name   = "postgres-mcp-s3-access"
+  policy = data.aws_iam_policy_document.s3_access.json
+}
+
+resource "aws_iam_role_policy_attachment" "s3_access" {
+  role       = aws_iam_role.postgres_mcp_sa.name
+  policy_arn = aws_iam_policy.s3_access.arn
 }
 
 resource "aws_iam_policy" "secrets_access" {

@@ -183,3 +183,8 @@ devenv.local.nix
 # pre-commit
 .pre-commit-config.yaml
 *.sql
+
+# EKS deploy secrets
+eks/allowed-ips.env
+eks/terraform/.terraform/
+eks/terraform/.terraform.lock.hcl

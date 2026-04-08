@@ -1,7 +1,6 @@
-# Lightweight Dockerfile for topmate-db-mcp-server (business logic only, no database)
-# Multi-stage build for smaller final image
+# Cloud Run optimized Dockerfile for postgres-mcp
+# Based on Dockerfile.aws but with faster startup for Cloud Run
 
-# Stage 1: Builder
 FROM python:3.12-slim-bookworm AS builder
 
 WORKDIR /app
@@ -9,18 +8,20 @@ WORKDIR /app
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Create virtual environment
 RUN python -m venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Install only the dependencies needed (no psycopg, pglast, etc.)
+# Copy all source files needed for installation
+COPY pyproject.toml README.md ./
+COPY src/ ./src/
+
+# Install dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir \
-    "mcp[cli]>=1.5.0" \
-    "uvicorn[standard]>=0.30.0" \
-    "requests>=2.31.0"
+    pip install --no-cache-dir .
 
 # Stage 2: Production image
 FROM python:3.12-slim-bookworm AS production
@@ -32,36 +33,40 @@ WORKDIR /app
 
 # Install runtime dependencies only
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
     curl \
+    tini \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
-
-# Copy only the files needed for this service
-COPY src/postgres_mcp/db_mcp_main.py /app/db_mcp_main.py
-COPY src/postgres_mcp/topmate_business_logic.py /app/topmate_business_logic.py
+COPY --from=builder /app/src /app/src
 
 # Set environment
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
-ENV PORT=9000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -sf http://localhost:${PORT}/health || exit 1
+# Default environment variables (override at runtime)
+ENV PORT=8000
+ENV ACCESS_MODE=restricted
+ENV TRANSPORT=sse
 
-# Expose port
-EXPOSE 9000
+# Expose SSE port
+EXPOSE 8000
 
 # Switch to non-root user
 USER appuser
 
 # Labels
 LABEL maintainer="Topmate Engineering"
-LABEL description="Topmate Business Logic MCP Server"
+LABEL description="PostgreSQL MCP Server for Cloud Run"
+LABEL version="0.5.0"
 
-# Entry point
-CMD ["python", "-u", "db_mcp_main.py"]
+# Use tini to properly handle signals
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+# Run postgres-mcp with SSE transport
+# The --sse-host=0.0.0.0 ensures it listens immediately on startup
+CMD ["python", "-m", "postgres_mcp", "--transport=sse", "--sse-host=0.0.0.0", "--sse-port=8000", "--access-mode=restricted"]

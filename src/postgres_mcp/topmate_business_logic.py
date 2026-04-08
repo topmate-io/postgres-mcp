@@ -99,10 +99,11 @@ TOPMATE_SCHEMA_GUIDE = {
             "key_columns": {
                 "id": "Integer primary key",
                 "title": "Service title",
-                "price": "Service price",
-                "expert_id": "Foreign key to user_user",
-                "is_active": "Service active status",
-                "service_type": "Type of service",
+                "charge": "Service price (NOT 'price')",
+                "user_id": "Foreign key to user_user (NOT 'expert_id')",
+                "is_visible": "Service visibility status (NOT 'is_active')",
+                "type": "Type of service (integer, NOT 'service_type')",
+                "created": "Service creation timestamp",
             },
         },
         "follower_follower": {

@@ -28,7 +28,7 @@ spec:
       serviceAccountName: postgres-mcp-sa
       containers:
         - name: topmate-bi-mcp
-          image: __AWS_ACCOUNT_ID__.dkr.ecr.ap-south-1.amazonaws.com/topmate-db-mcp-server:__IMAGE_TAG__
+          image: 072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-db-mcp-server:latest
           ports:
             - containerPort: 9000
               protocol: TCP
@@ -59,6 +59,13 @@ spec:
             #   value: "http://autodm-mcp-service.postgres-mcp.svc:80/autodm-mcp"
             # - name: POSTGRES_MCP_WEBSITE_BUILDER_URL
             #   value: "http://website-builder-mcp-service.postgres-mcp.svc:80/website-builder-mcp"
+            # --- V2 Financial Services databases (read-only via separate postgres-mcp pods) ---
+            - name: POSTGRES_MCP_V2_LEDGER_URL
+              value: "http://postgres-mcp-v2-ledger-service.postgres-mcp.svc:80/postgres-mcp"
+            - name: POSTGRES_MCP_V2_PAYMENT_URL
+              value: "http://postgres-mcp-v2-payment-service.postgres-mcp.svc:80/postgres-mcp"
+            - name: POSTGRES_MCP_V2_PAYOUT_URL
+              value: "http://postgres-mcp-v2-payout-service.postgres-mcp.svc:80/postgres-mcp"
             # --- Logic Hub ---
             - name: TOPMATE_LOGIC_HUB_BASE_URL
               valueFrom:
@@ -152,7 +159,7 @@ spec:
             - name: ATHENA_DATABASE
               value: "webengage-events"
             - name: ATHENA_WORKGROUP
-              value: "webengage-sql"
+              value: "mcp-analytics"
             # --- AWS S3 ---
             - name: S3_BUCKET
               valueFrom:

@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-mcp-v2-payment-service
+  namespace: postgres-mcp
+  labels:
+    app: postgres-mcp-v2-payment
+    app.kubernetes.io/name: postgres-mcp-v2-payment
+    app.kubernetes.io/part-of: topmate-mcp
+spec:
+  type: ClusterIP
+  selector:
+    app: postgres-mcp-v2-payment
+  ports:
+    - port: 80
+      targetPort: 8000
+      protocol: TCP

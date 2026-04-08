@@ -8,9 +8,15 @@ resources:
   - service-account.yaml
   - configmap-allowlist.yaml
   - deployment-postgres-mcp.yaml
+  - deployment-postgres-mcp-v2-ledger.yaml
+  - deployment-postgres-mcp-v2-payment.yaml
+  - deployment-postgres-mcp-v2-payout.yaml
   - deployment-db-mcp-server.yaml
   - deployment-redis.yaml
   - service-postgres-mcp.yaml
+  - service-postgres-mcp-v2-ledger.yaml
+  - service-postgres-mcp-v2-payment.yaml
+  - service-postgres-mcp-v2-payout.yaml
   - service-db-mcp-server.yaml
   - service-redis.yaml
   - hpa-postgres-mcp.yaml

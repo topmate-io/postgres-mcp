@@ -191,6 +191,49 @@ if [ "$SKIP_SECRETS" = false ]; then
 
   echo "Kubernetes secret postgres-mcp-secrets created/updated."
 
+  # Create V2 Financial Services database secrets
+  echo ""
+  echo "Creating V2 Financial Services database secrets..."
+  echo "  Secrets needed in AWS Secrets Manager:"
+  echo "    - /financial/ledger/production/database_url"
+  echo "    - /financial/payment-orch/production/database_url"
+  echo "    - /financial/payout/production/database_url"
+  echo ""
+
+  V2_SECRET_ARGS=()
+
+  V2_LEDGER_URI=$(aws secretsmanager get-secret-value \
+    --secret-id /financial/ledger/production/database_url \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    V2_SECRET_ARGS+=(--from-literal="v2-ledger-database-uri=${V2_LEDGER_URI}") || \
+    echo "  WARN: /financial/ledger/production/database_url not found (V2 ledger MCP will not start)"
+
+  V2_PAYMENT_URI=$(aws secretsmanager get-secret-value \
+    --secret-id /financial/payment-orch/production/database_url \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    V2_SECRET_ARGS+=(--from-literal="v2-payment-database-uri=${V2_PAYMENT_URI}") || \
+    echo "  WARN: /financial/payment-orch/production/database_url not found (V2 payment MCP will not start)"
+
+  V2_PAYOUT_URI=$(aws secretsmanager get-secret-value \
+    --secret-id /financial/payout/production/database_url \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    V2_SECRET_ARGS+=(--from-literal="v2-payout-database-uri=${V2_PAYOUT_URI}") || \
+    echo "  WARN: /financial/payout/production/database_url not found (V2 payout MCP will not start)"
+
+  if [ ${#V2_SECRET_ARGS[@]} -gt 0 ]; then
+    kubectl create secret generic postgres-mcp-v2-secrets \
+      "${V2_SECRET_ARGS[@]}" \
+      -n "${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+    echo "Kubernetes secret postgres-mcp-v2-secrets created/updated."
+  else
+    echo "  No V2 database secrets found. Creating placeholder secret."
+    kubectl create secret generic postgres-mcp-v2-secrets \
+      --from-literal=placeholder="none" \
+      -n "${NAMESPACE}" \
+      --dry-run=client -o yaml | kubectl apply -f -
+  fi
+
   # Create topmate-bi-secrets (for BI MCP server: GitHub, GCP, S3, Redis)
   echo ""
   echo "Creating topmate-bi-secrets (optional keys)..."
@@ -220,7 +263,7 @@ if [ "$SKIP_SECRETS" = false ]; then
   # Private key: write to temp file (PEM has newlines that break --from-literal)
   BI_SECRET_FILE_ARGS=()
   TMPDIR_SECRETS=$(mktemp -d)
-  trap "rm -rf ${TMPDIR_SECRETS}" EXIT
+  # NOTE: EXIT trap is set later (after sed substitution) to combine cleanup
 
   aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/github-app-private-key \
@@ -283,6 +326,19 @@ if [ "$SKIP_SECRETS" = false ]; then
     BI_SECRET_ARGS+=(--from-literal="auth-token=${AUTH_TOKEN_VAL}") || \
     echo "  WARN: topmate/bi-mcp/auth-token not found (bearer auth disabled)"
 
+  # WebEngage / Athena AWS credentials
+  WEBENGAGE_ACCESS_KEY_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/webengage-aws-access-key-id \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS+=(--from-literal="webengage-aws-access-key-id=${WEBENGAGE_ACCESS_KEY_VAL}") || \
+    echo "  WARN: topmate/bi-mcp/webengage-aws-access-key-id not found (Athena disabled)"
+
+  WEBENGAGE_SECRET_KEY_VAL=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/bi-mcp/webengage-aws-secret-access-key \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) && \
+    BI_SECRET_ARGS+=(--from-literal="webengage-aws-secret-access-key=${WEBENGAGE_SECRET_KEY_VAL}") || \
+    echo "  WARN: topmate/bi-mcp/webengage-aws-secret-access-key not found (Athena disabled)"
+
   # OAuth 2.1 secrets (Claude.ai Custom Connector)
   OAUTH_CLIENT_ID_VAL=$(aws secretsmanager get-secret-value \
     --secret-id topmate/bi-mcp/oauth-client-id \
@@ -326,8 +382,8 @@ echo ""
 echo "Substituting manifest placeholders..."
 MANIFEST_DIR="${SCRIPT_DIR}/manifests/base"
 
-# Default allowed IPs: VPC + localhost. Override with DEPLOY_ALLOWED_IPS env var.
-ALLOWED_IPS="${DEPLOY_ALLOWED_IPS:-10.0.0.0/16,127.0.0.1,::1}"
+# Default allowed IPs: VPC + localhost + team IPs. Override with DEPLOY_ALLOWED_IPS env var.
+ALLOWED_IPS="${DEPLOY_ALLOWED_IPS:-10.0.0.0/16,127.0.0.1,::1,157.20.14.22,106.51.68.3,101.0.63.20,2402:e280:2109:1f1:e45c:3f62:ed7:2b51}"
 
 # IMAGE_TAG may not be set if --skip-build was used
 DEPLOY_IMAGE_TAG="${IMAGE_TAG:-latest}"
@@ -342,8 +398,13 @@ done
 # Clean up .bak files (macOS sed creates them with -i.bak)
 rm -f "${MANIFEST_DIR}"/*.yaml.bak
 
-# Ensure placeholders are restored even if kubectl fails (set -e exit)
-trap 'echo "Restoring manifest placeholders..."; git -C "${REPO_ROOT}" checkout -- "${MANIFEST_DIR}"/*.yaml 2>/dev/null || true' EXIT
+# Combined cleanup: restore manifest placeholders AND remove temp secrets dir
+cleanup() {
+  echo "Restoring manifest placeholders..."
+  git -C "${REPO_ROOT}" checkout -- "${MANIFEST_DIR}"/*.yaml 2>/dev/null || true
+  rm -rf "${TMPDIR_SECRETS:-}" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # -----------------------------------------------------------------------------
 # Step 6: Apply Kustomize Manifests
@@ -363,6 +424,11 @@ kubectl rollout status deployment/redis -n "${NAMESPACE}" --timeout=120s
 
 echo "Waiting for postgres-mcp deployment..."
 kubectl rollout status deployment/postgres-mcp -n "${NAMESPACE}" --timeout=300s
+
+echo "Waiting for V2 postgres-mcp deployments..."
+kubectl rollout status deployment/postgres-mcp-v2-ledger -n "${NAMESPACE}" --timeout=300s
+kubectl rollout status deployment/postgres-mcp-v2-payment -n "${NAMESPACE}" --timeout=300s
+kubectl rollout status deployment/postgres-mcp-v2-payout -n "${NAMESPACE}" --timeout=300s
 
 echo "Waiting for db-mcp-server deployment..."
 kubectl rollout status deployment/db-mcp-server -n "${NAMESPACE}" --timeout=300s
