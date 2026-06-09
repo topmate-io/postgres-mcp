@@ -66,6 +66,33 @@ spec:
                 configMapKeyRef:
                   name: postgres-mcp-allowlist
                   key: allowed-ips
+            # Static Bearer token that bypasses the IP allowlist (shared with db-mcp).
+            # Holders can reach postgres-mcp from any IP (e.g. staging EC2, CI).
+            - name: AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: auth-token
+                  optional: true
+            # --- Caller-scoped access (Loop end-user identity forwarding) ---
+            # Validates Authorization: Token <x> against galactus /profile/.
+            # postgres-mcp is admin-only: any non-superadmin scope is 403'd.
+            - name: CALLER_SCOPE_ENABLED
+              value: "true"
+            - name: GALACTUS_PROFILE_URL
+              value: "https://api.galactus.run/profile/"
+            - name: SUPERADMIN_EMAILS
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: superadmin-emails
+                  optional: true
+            - name: SUPERADMIN_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: superadmin-tokens
+                  optional: true
           resources:
             requests:
               memory: "256Mi"

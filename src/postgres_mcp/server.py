@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import contextvars
+import hmac
 import ipaddress
 import logging
 import os
@@ -39,6 +40,7 @@ from .top_queries import TopQueriesCalc
 from .topmate_business_logic import TopmateBuisnessLogic
 from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
+from . import caller_identity
 
 # Initialize FastMCP with default settings
 mcp = FastMCP("postgres-mcp")
@@ -94,16 +96,22 @@ def format_text_response(text: Any) -> ResponseType:
 def _sanitize_error(error: str) -> str:
     """Map internal errors to user-friendly messages."""
     e_lower = error.lower()
-    if any(k in e_lower for k in ("connect", "refused", "resolve", "network", "timeout expired")):
-        return "Database temporarily unavailable. Please try again in a moment."
-    if "timeout" in e_lower or "cancel" in e_lower:
-        return "Query took too long. Try a more specific query with filters or a LIMIT clause."
+    # Check specific Postgres error classes BEFORE generic keyword matching,
+    # otherwise table names like "instagram_connections" match "connect" and
+    # produce a misleading "temporarily unavailable" message.
+    if "does not exist" in e_lower:
+        return f"Object not found: {error.split('does not exist')[0].strip().split()[-1] if 'does not exist' in error else 'unknown'}"
     if "syntax" in e_lower:
         return "Invalid query syntax. Please check your SQL."
     if "permission" in e_lower or "denied" in e_lower:
         return "Permission denied for this operation."
-    if "does not exist" in e_lower:
-        return f"Object not found: {error.split('does not exist')[0].strip().split()[-1] if 'does not exist' in error else 'unknown'}"
+    if "duplicate" in e_lower:
+        return "Duplicate entry — this record already exists."
+    if any(k in e_lower for k in ("connection refused", "could not connect", "connection reset",
+                                   "name resolution", "network unreachable", "timeout expired")):
+        return "Database temporarily unavailable. Please try again in a moment."
+    if "timeout" in e_lower or "cancel" in e_lower:
+        return "Query took too long. Try a more specific query with filters or a LIMIT clause."
     if "duplicate" in e_lower:
         return "Duplicate entry — this record already exists."
     # Generic fallback — don't leak internals
@@ -856,9 +864,14 @@ class RateLimiterMiddleware:
 class IPAllowlistMiddleware:
     """ASGI middleware that restricts access to allowed IPs/CIDRs.
 
-    Reads comma-separated IPs/CIDRs from the ALLOWED_IPS env var.
+    Two ways to pass:
+      1. Client IP is in ``ALLOWED_IPS`` (CIDRs read from env).
+      2. Request carries a valid ``Authorization: Bearer <AUTH_TOKEN>`` — bypasses
+         the IP check for ops/backend callers from non-whitelisted hosts.
+
     Health check paths are always exempt so ALB probes continue working.
-    If ALLOWED_IPS is empty or unset, all traffic is allowed (backwards compatible).
+    If ``ALLOWED_IPS`` is empty AND ``AUTH_TOKEN`` is empty, all traffic is allowed
+    (backwards compatible).
     """
 
     HEALTH_PATHS = {"/", "/health", "/healthz"}
@@ -866,6 +879,9 @@ class IPAllowlistMiddleware:
     def __init__(self, app):
         self.app = app
         self.allowed_networks = self._load_allowed_ips()
+        self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
+        if self._auth_token:
+            logger.info("IP allowlist: static Bearer token bypass enabled")
 
     def _load_allowed_ips(self):
         raw = os.getenv("ALLOWED_IPS", "").strip()
@@ -923,6 +939,17 @@ class IPAllowlistMiddleware:
                 return path[len(prefix):] or "/"
         return path
 
+    def _has_valid_bearer(self, scope) -> bool:
+        """Return True when the request carries a valid static Bearer token."""
+        if not self._auth_token:
+            return False
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        auth = headers.get(b"authorization", b"").decode("latin-1")
+        if not auth.startswith("Bearer "):
+            return False
+        presented = auth[len("Bearer "):].strip()
+        return bool(presented) and hmac.compare_digest(presented, self._auth_token)
+
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and self.allowed_networks is not None:
             path = self._get_path(scope)
@@ -931,7 +958,7 @@ class IPAllowlistMiddleware:
             if path not in self.HEALTH_PATHS:
                 client_ip = self._get_client_ip(scope)
 
-                if not self._is_allowed(client_ip):
+                if not self._is_allowed(client_ip) and not self._has_valid_bearer(scope):
                     logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
                     await send({
                         "type": "http.response.start",
@@ -945,6 +972,84 @@ class IPAllowlistMiddleware:
                     return
 
         await self.app(scope, receive, send)
+
+
+class CallerIdentityMiddleware:
+    """Capture the forwarded end-user identity and gate admin-only tools.
+
+    postgres-mcp exposes only DB-admin tools (raw SQL / DB internals) — none can
+    be safely per-creator-scoped. Policy:
+
+    * No ``X-User-Scope`` header  -> legacy caller -> pass through unchanged.
+    * Authenticated superadmin     -> pass through (full access).
+    * ``X-User-Scope`` present but token invalid -> 401.
+    * Any other resolved scope     -> 403 (defense-in-depth; admin-only server).
+
+    Disabled entirely when ``CALLER_SCOPE_ENABLED=false``. The decision is made at
+    the ASGI layer (works for both SSE and Streamable HTTP), so it does not depend
+    on the contextvar reaching the tool coroutine.
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+        self.enabled = os.getenv("CALLER_SCOPE_ENABLED", "true").lower() != "false"
+        self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
+        self._sa_emails = caller_identity.superadmin_emails_from_env()
+        self._sa_tokens = caller_identity.superadmin_tokens_from_env()
+
+    def _get_path(self, scope):
+        path = scope.get("path", "")
+        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
+            if path.startswith(prefix):
+                return path[len(prefix):] or "/"
+        return path
+
+    async def _deny(self, send, status, err, msg):
+        await send({
+            "type": "http.response.start",
+            "status": status,
+            "headers": [[b"content-type", b"application/json"]],
+        })
+        await send({
+            "type": "http.response.body",
+            "body": f'{{"error":"{err}","message":"{msg}"}}'.encode(),
+        })
+
+    async def __call__(self, scope, receive, send):
+        if not self.enabled or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        if self._get_path(scope) in self.HEALTH_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        transport_trusted = caller_identity.is_transport_trusted(
+            headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens
+        )
+        ident = caller_identity.resolve_identity(
+            headers,
+            validate_token=caller_identity.validate_token,
+            transport_trusted=transport_trusted,
+            superadmin_emails=self._sa_emails,
+        )
+        ctx_token = caller_identity.caller_ctx.set(ident)
+        try:
+            sc = ident["scope"]
+            if sc is None or sc == "superadmin":
+                await self.app(scope, receive, send)  # legacy or admin -> unchanged
+                return
+            if sc == caller_identity.INVALID:
+                logger.warning("postgres-mcp: scoped caller presented an invalid end-user token")
+                await self._deny(send, 401, "unauthorized", "Invalid end-user token")
+                return
+            logger.warning("postgres-mcp: rejecting non-superadmin scope=%s on admin-only server", sc)
+            await self._deny(send, 403, "forbidden", "postgres-mcp tools are superadmin-only")
+            return
+        finally:
+            caller_identity.caller_ctx.reset(ctx_token)
 
 
 class SSEKeepAliveMiddleware:
@@ -1228,15 +1333,14 @@ async def main():
         # Middleware stack (outermost → innermost):
         # 0. RequestIDMiddleware — assigns correlation ID to every request
         # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
-        # 2. BearerTokenMiddleware — rejects unauthenticated requests
-        # 3. IPAllowlistMiddleware — restricts to allowed IP ranges
-        # 4. RateLimiterMiddleware — per-IP rate limiting
-        # 5. HealthCheckMiddleware — ALB health probes
-        # 6. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
+        # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer
+        # 3. RateLimiterMiddleware — per-IP rate limiting
+        # 4. HealthCheckMiddleware — ALB health probes
+        # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
         wrapped_app = RequestIDMiddleware(
             CORSMiddleware(
-                BearerTokenMiddleware(
-                    IPAllowlistMiddleware(
+                IPAllowlistMiddleware(
+                    CallerIdentityMiddleware(
                         RateLimiterMiddleware(
                             HealthCheckMiddleware(
                                 SSEKeepAliveMiddleware(route_by_transport, interval=15)
@@ -1248,7 +1352,10 @@ async def main():
                 )
             )
         )
-        logger.info("Applied middleware stack: RequestID + CORS + BearerToken + IPAllowlist + RateLimiter + HealthCheck + SSEKeepAlive")
+        logger.info(
+            "Applied middleware stack: RequestID + CORS + IPAllowlist(+TokenBypass) + "
+            "CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
+        )
 
         # Attach request-ID filter to root logger so all log records include it
         logging.getLogger().addFilter(RequestIDLogFilter())

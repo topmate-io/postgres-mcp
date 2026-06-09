@@ -40,9 +40,13 @@ spec:
               value: "sse"
             - name: LOG_LEVEL
               value: "INFO"
+            - name: RATE_LIMIT_MAX_REQUESTS
+              value: "1000"
+            - name: RATE_LIMIT_WINDOW_SECONDS
+              value: "60"
             # --- LLM Provider (switch via this env var) ---
             - name: LLM_PROVIDER
-              value: "openrouter"
+              value: "openai"
             - name: ENABLE_CLARIFICATION
               value: "true"
             # --- Postgres MCP (primary: topmate-db-prod-replica) ---
@@ -127,14 +131,14 @@ spec:
             #       name: topmate-bi-secrets
             #       key: anthropic-api-key
             #       optional: true
-            # --- OpenAI (when switching to OpenAI) ---
-            # - name: OPENAI_API_KEY
-            #   valueFrom:
-            #     secretKeyRef:
-            #       name: topmate-bi-secrets
-            #       key: openai-api-key
-            #       optional: true
-            # --- OpenRouter ---
+            # --- OpenAI ---
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: openai-api-key
+                  optional: true
+            # --- OpenRouter (kept as fallback; key not present in AWS Secrets Manager yet) ---
             - name: OPENROUTER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -195,6 +199,28 @@ spec:
                 secretKeyRef:
                   name: topmate-bi-secrets
                   key: auth-token
+                  optional: true
+            # --- Caller-scoped access (Loop end-user identity forwarding) ---
+            # Loop forwards X-User-Scope/Username/Email on every tools/call over the
+            # Streamable-HTTP /mcp path (https://mcp.gabbanext.run/db-mcp/mcp).
+            # Trusted transport (AUTH_TOKEN Bearer or SUPERADMIN_TOKENS) trusts the
+            # forwarded identity; an end-user `Authorization: Token <x>` is validated
+            # against galactus and superadmin requires the allowlist below.
+            - name: CALLER_SCOPE_ENABLED
+              value: "true"
+            - name: GALACTUS_PROFILE_URL
+              value: "https://api.galactus.run/profile/"
+            - name: SUPERADMIN_EMAILS
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: superadmin-emails
+                  optional: true
+            - name: SUPERADMIN_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: superadmin-tokens
                   optional: true
             # --- OAuth 2.1 (Claude.ai Custom Connector) ---
             - name: OAUTH_CLIENT_ID
