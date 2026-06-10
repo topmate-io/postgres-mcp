@@ -140,3 +140,47 @@ def test_untrusted_no_auth_with_scope_is_invalid():
     headers = {b"x-user-scope": b"expert"}
     ident = ci.resolve_identity(headers, transport_trusted=False, validate_token=lambda t: {"username": "x"})
     assert ident["scope"] == ci.INVALID
+
+
+# --- P2: galactus token validation is offloaded off the event loop -----------
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.asyncio
+async def test_validate_token_async_offloads_and_does_not_block(monkeypatch):
+    import asyncio
+    import time as _time
+    ci._cache.clear()
+
+    def slow_blocking(token):
+        _time.sleep(0.2)
+        return {"username": "x"}
+
+    monkeypatch.setattr(ci, "_validate_token_blocking", slow_blocking)
+    task = asyncio.create_task(ci.validate_token_async("cold"))
+    ticks = 0
+    while not task.done():
+        ticks += 1
+        await asyncio.sleep(0.02)
+    assert ticks >= 3
+    assert (await task) == {"username": "x"}
+
+
+def test_validate_token_blocking_timeout_is_2_5(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {}
+
+    def fake_get(url, headers, timeout):
+        captured["timeout"] = timeout
+        return _Resp()
+
+    monkeypatch.setattr(ci.httpx, "get", fake_get)
+    ci._cache.clear()
+    ci._validate_token_blocking("newtok")
+    assert captured["timeout"] == 2.5  # dropped from 8.0

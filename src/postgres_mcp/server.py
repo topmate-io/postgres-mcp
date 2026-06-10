@@ -1029,9 +1029,17 @@ class CallerIdentityMiddleware:
         transport_trusted = caller_identity.is_transport_trusted(
             headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens
         )
+        # P2: pre-resolve a Tier-2 galactus token OFF the event loop so the
+        # blocking HTTP call doesn't freeze the single replica; hand
+        # resolve_identity a memoized validator so it stays pure/sync.
+        scheme, cred = caller_identity.parse_auth(headers)
+        token_validator = caller_identity.validate_token
+        if not transport_trusted and scheme == "token" and cred:
+            _profile = await caller_identity.validate_token_async(cred)
+            token_validator = lambda _t, _p=_profile: _p  # noqa: E731
         ident = caller_identity.resolve_identity(
             headers,
-            validate_token=caller_identity.validate_token,
+            validate_token=token_validator,
             transport_trusted=transport_trusted,
             superadmin_emails=self._sa_emails,
         )

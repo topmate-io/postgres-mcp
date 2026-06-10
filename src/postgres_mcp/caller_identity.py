@@ -30,6 +30,7 @@ validator in.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hmac
 import logging
@@ -63,26 +64,24 @@ def _scope_from_profile(p: dict) -> str:
     return "seeker"
 
 
-def validate_token(token: str) -> dict | None:
-    """Validate a Topmate Knox token against galactus /profile/.
-
-    Returns the profile dict on success, or ``None`` on any failure. Cached for
-    ``_TTL`` seconds (both hits and misses) so invalid tokens don't repeatedly
-    hit galactus either.
-    """
-    if not token:
-        return None
+def _cached_profile(token: str) -> tuple[bool, dict | None]:
+    """Return ``(hit, profile)`` from the 300s cache (hit=False => not cached)."""
     now = time.monotonic()
     with _cache_lock:
-        hit = _cache.get(token)
-        if hit and (now - hit[1]) < _TTL:
-            return hit[0]
+        entry = _cache.get(token)
+        if entry and (now - entry[1]) < _TTL:
+            return True, entry[0]
+    return False, None
+
+
+def _validate_token_blocking(token: str) -> dict | None:
+    """Blocking galactus /profile/ call + cache write. Run in a worker thread."""
     profile: dict | None = None
     try:
         resp = httpx.get(
             _GALACTUS_URL,
             headers={"Authorization": f"Token {token}", "Accept": "application/json"},
-            timeout=8.0,
+            timeout=2.5,
         )
         if resp.status_code == 200:
             profile = resp.json()
@@ -90,8 +89,33 @@ def validate_token(token: str) -> dict | None:
         logger.warning("galactus validation error: %s", e)
         profile = None
     with _cache_lock:
-        _cache[token] = (profile, now)
+        _cache[token] = (profile, time.monotonic())
     return profile
+
+
+def validate_token(token: str) -> dict | None:
+    """Validate a Topmate Knox token against galactus /profile/ (sync, cached 300s).
+
+    Kept synchronous for back-compat and the pure ``resolve_identity`` contract.
+    The async ASGI path uses :func:`validate_token_async` so the blocking HTTP
+    call doesn't freeze the single postgres-mcp replica's event loop (P2).
+    """
+    if not token:
+        return None
+    hit, profile = _cached_profile(token)
+    if hit:
+        return profile
+    return _validate_token_blocking(token)
+
+
+async def validate_token_async(token: str) -> dict | None:
+    """Validate a Knox token, offloaded off the event loop (P2). Cached 300s."""
+    if not token:
+        return None
+    hit, profile = _cached_profile(token)
+    if hit:
+        return profile
+    return await asyncio.to_thread(_validate_token_blocking, token)
 
 
 def parse_auth(headers: dict[bytes, bytes]) -> tuple[str | None, str | None]:
