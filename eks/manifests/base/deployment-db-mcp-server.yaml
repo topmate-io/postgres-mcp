@@ -53,7 +53,7 @@ spec:
             - name: POSTGRES_MCP_URL
               value: "http://postgres-mcp-service.postgres-mcp.svc:80/postgres-mcp"
             - name: POSTGRES_MCP_TRANSPORT
-              value: "sse"
+              value: "streamable_http"  # S1: stateless /mcp path so postgres-mcp can scale out
             - name: POSTGRES_MCP_TIMEOUT
               value: "60"
             # --- Additional databases (optional - set URLs when postgres-mcp pods are deployed for each) ---

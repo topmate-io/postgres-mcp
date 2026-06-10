@@ -11,9 +11,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: postgres-mcp
-  # SSE sessions are in-memory; single replica until Redis session store is wired.
-  minReplicas: 1
-  maxReplicas: 1
+  # S1: stateless /mcp path — safe to scale horizontally. minReplicas:2 also
+  # removes the rolling-update SPOF.
+  minReplicas: 2
+  maxReplicas: 5
   metrics:
     - type: Resource
       resource:

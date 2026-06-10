@@ -8,9 +8,11 @@ metadata:
     app.kubernetes.io/name: postgres-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  # Single replica: SSE sessions are in-memory, multi-replica requires
-  # shared session store or sticky sessions (ALB lb_cookie + client cookie support)
-  replicas: 1
+  # S1: stateless /mcp (stateless_http=True) — inter-MCP callers use the
+  # session-free streamable path, so multiple replicas are safe behind the
+  # non-sticky in-cluster Service. External SSE callers keep ALB lb_cookie
+  # stickiness. Requires the db-mcp POSTGRES_MCP_TRANSPORT=streamable_http flip.
+  replicas: 3
   selector:
     matchLabels:
       app: postgres-mcp
@@ -108,11 +110,11 @@ spec:
                   optional: true
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "100m"
-            limits:
               memory: "512Mi"
               cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1500m"   # S1: raise the 0.5-vCPU cap so each replica can drive its pool
           livenessProbe:
             httpGet:
               path: /healthz

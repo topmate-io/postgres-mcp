@@ -42,8 +42,12 @@ from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
 from . import caller_identity
 
-# Initialize FastMCP with default settings
-mcp = FastMCP("postgres-mcp")
+# S1: stateless_http makes the Streamable-HTTP (/mcp) session manager stateless
+# so postgres-mcp can run multiple replicas behind the non-sticky in-cluster
+# Service. The SSE (/sse) path stays session-bound (external callers unaffected);
+# the inter-MCP db-mcp client must therefore use /mcp (POSTGRES_MCP_TRANSPORT=
+# streamable_http) once replicas>1. json_response returns JSON on /mcp (mirrors db-mcp).
+mcp = FastMCP("postgres-mcp", stateless_http=True, json_response=True)
 
 # Constants
 PG_STAT_STATEMENTS = "pg_stat_statements"

@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     # M6: cap the major so an SDK 2.x is an explicit, reviewed upgrade.
-    "mcp[cli]>=1.5.0,<2.0.0",
+    "mcp[cli]>=1.8.0,<2.0.0",  # S1: stateless_http kwarg guaranteed present
     "psycopg[binary]>=3.2.6",
     "humanize>=4.8.0",
     "pglast==7.2.0",
