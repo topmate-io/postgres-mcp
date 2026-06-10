@@ -776,6 +776,7 @@ version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "attrs" },
+    { name = "httpx" },
     { name = "humanize" },
     { name = "instructor" },
     { name = "mcp", extra = ["cli"] },
@@ -796,9 +797,10 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "attrs", specifier = ">=25.3.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "humanize", specifier = ">=4.8.0" },
     { name = "instructor", specifier = ">=1.7.9" },
-    { name = "mcp", extras = ["cli"], specifier = ">=1.5.0" },
+    { name = "mcp", extras = ["cli"], specifier = ">=1.5.0,<2.0.0" },
     { name = "pglast", specifier = "==7.2.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.6" },
     { name = "psycopg-pool", specifier = ">=3.2.6" },
