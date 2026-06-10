@@ -398,7 +398,11 @@ done
 # Clean up .bak files (macOS sed creates them with -i.bak)
 rm -f "${MANIFEST_DIR}"/*.yaml.bak
 
-# Combined cleanup: restore manifest placeholders AND remove temp secrets dir
+# Combined cleanup: restore manifest placeholders AND remove temp secrets dir.
+# NOTE: this `git checkout -- manifests/base/*.yaml` reverts the working tree to
+# the COMMITTED manifests after deploy. So any manifest edit (S1 replicas/CPU,
+# POOL/DB_POOL env, S6, REQUIRE_SIGNED_IDENTITY, redis/PDB) MUST be committed
+# before running deploy.sh, else a dirty-tree change is silently reverted here.
 cleanup() {
   echo "Restoring manifest placeholders..."
   git -C "${REPO_ROOT}" checkout -- "${MANIFEST_DIR}"/*.yaml 2>/dev/null || true
