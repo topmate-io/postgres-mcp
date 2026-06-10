@@ -123,3 +123,19 @@ async def test_mw_flag_on(monkeypatch, keypair):
     tok = _mint(priv, scope="superadmin", username="admin")
     s2 = await _run(mw, _scope({b"x-user-scope": b"superadmin", b"x-user-username": b"admin", b"x-identity-jwt": tok.encode()}))
     assert s2 == [200]
+
+
+def test_signed_identity_without_scope_header_derives_from_claim(keypair):
+    # G1/G3 hardening: a verified JWT governs even without X-User-Scope (review note).
+    priv, pub = keypair
+    tok = _mint(priv, scope="superadmin", username="admin")
+    claims = _verify(pub, tok)
+    ident = ci.resolve_identity(
+        {b"x-identity-jwt": tok.encode()}, signed_claims=claims, require_signed=True
+    )
+    assert ident["scope"] == "superadmin" and ident["username"] == "admin"
+
+
+def test_no_scope_header_no_jwt_still_legacy():
+    ident = ci.resolve_identity({}, signed_claims=None, require_signed=True)
+    assert ident["scope"] is None  # only a verified signature bypasses Hard rule #1

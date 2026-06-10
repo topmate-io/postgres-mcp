@@ -176,7 +176,11 @@ def resolve_identity(
     raw_scope_s = raw_scope.decode("latin-1").strip() if raw_scope else None
 
     # Hard rule #1: no X-User-Scope header => legacy => unchanged behavior.
-    if not raw_scope_s:
+    # Exception (G1/G3 hardening): under require_signed, a VERIFIED signature is
+    # authoritative even without the X-User-Scope routing header — fall through so
+    # the signed claim governs, rather than silently treating a signed request as
+    # legacy/unrestricted (defends against a Loop client that omits the header).
+    if not raw_scope_s and not (require_signed and signed_claims is not None):
         return {"scope": None, "username": None, "email": None, "raw_scope_header": None}
 
     hdr_username = (headers.get(b"x-user-username") or b"").decode("latin-1").strip() or None
