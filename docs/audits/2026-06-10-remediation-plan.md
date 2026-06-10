@@ -44,7 +44,15 @@ Grounded per-finding specs (workflow wf_badb1c3b-4d1): `/tmp/mcp-specs/spec_00..
 - ✅ INFRA (LOOP-305, b1a8d2e): Redis off-spot+do-not-disrupt; PDB minAvailable→maxUnavailable; deploy.sh note. A4 resolved by S1's transport flip.
 **DEFERRED (documented): pg-M1** (raise McpError) — risky wire-semantics change, lower value (pg sits behind the inter-MCP client; db-mcp M1 already gives Loop isError). **D2** (vendored module).
 **~33/35 findings done+committed (D2 + pg-M1 deferred).** db-mcp 244 · pg fast-unit ~135.
-**Next — Batch 6 (FINAL):** local-Docker smoke rig (LOOP-305) — `docker-compose.test.yml` (redis + throwaway seeded postgres + both MCPs) + `tests/fixtures/seed.sql` + `tests/smoke/run_smoke.sh` (rows A–I incl G2 cross-join reject + Bearer-only 401), then build+up+run the smoke matrix. Then mark LOOP-298 + sub-issues Done + final summary.
+- ✅ Batch 6 / Docker (LOOP-305, 65dda0b): `docker-compose.test.yml` + `tests/fixtures/seed.sql` + `tests/smoke/run_smoke.sh`. **Built both images, ran the rig live, smoke matrix all-PASS:** health bypass 200; unauth scoped → 401 (both, G1/G3 boundary live); Tier-1 trusted passes; pg admin-only expert → 403; stateless `/mcp` served. G2-via-NL SKIPped (no LLM key) — proven by the 15 `test_sql_scope_guard.py` units. Torn down `-v`.
+
+## ✅ REMEDIATION COMPLETE
+**~33/35 findings done + committed.** 2 documented deferrals: **D2** (vendored `_identity_core.py` — repos diverged structurally, high-risk) and **pg-M1** (raise McpError — riskier wire change, lower value behind the inter-MCP client). db-mcp suite **127 → 244**; postgres-mcp gained JWT/readiness/annotation/stateless tests (+4 pre-existing `explain/` testcontainer failures, unrelated). Adversarial review of G1/G3: **no exploitable bypass**.
+
+**Operator follow-ups before/at deploy:**
+1. Flip `REQUIRE_SIGNED_IDENTITY=true` on both deployments AFTER Loop ships RS256 signing per `topmate-db-mcp-server/docs/LOOP_SIGNED_IDENTITY_CONTRACT.md` (create the `topmate-bi-secrets/identity-jwt-public-key` secret first).
+2. Verify RDS `SHOW max_connections;` + `pg_stat_activity` before raising `DB_POOL_MAX_SIZE` past 20 (replica shared with Django).
+3. Review the diff + deploy via `eks/deploy.sh` (commit manifests first — the EXIT trap reverts the working tree).
 **D2 (vendored `_identity_core.py`) DEFERRED** — the two repos' caller_identity files diverged structurally (db-mcp has admin_only/asgi_utils/enforcement helpers; pg has different middleware location), so byte-identical vendoring is high-risk for both suites. P1/P2/G1/G3 done per-repo; D2 left as a lower-risk follow-up (noted in LOOP-303).
 Then Batch 5 (PG: A1,A5,M1,M3,S1,POOL,S6,manifests→LOOP-304/302/301/305), Batch 6 (docker rig + run smoke→LOOP-305).
 **Commit plan when keyed:** per-finding commits via selective `git add` (file sets are disjoint). Files staged-ready listed by `git status` in db-mcp.
