@@ -998,6 +998,16 @@ class CallerIdentityMiddleware:
         self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
         self._sa_emails = caller_identity.superadmin_emails_from_env()
         self._sa_tokens = caller_identity.superadmin_tokens_from_env()
+        # G1/G3 signed-identity gate (default off).
+        self._require_signed = caller_identity.require_signed_identity_from_env()
+        self._identity_pubkey = caller_identity.identity_jwt_public_key_from_env()
+        self._identity_aud = caller_identity.identity_jwt_audience_from_env()
+        self._identity_leeway = caller_identity.identity_jwt_leeway_from_env()
+        if self._require_signed and not self._identity_pubkey:
+            logger.critical(
+                "REQUIRE_SIGNED_IDENTITY=true but no IDENTITY_JWT_PUBLIC_KEY[_PATH] "
+                "configured; all trusted-transport callers will be rejected (fail-closed)."
+            )
 
     def _get_path(self, scope):
         path = scope.get("path", "")
@@ -1037,11 +1047,22 @@ class CallerIdentityMiddleware:
         if not transport_trusted and scheme == "token" and cred:
             _profile = await caller_identity.validate_token_async(cred)
             token_validator = lambda _t, _p=_profile: _p  # noqa: E731
+        # G1/G3: verify the signed identity JWT (CPU-only) when the gate is on.
+        signed_claims = None
+        if self._require_signed:
+            signed_claims = caller_identity.verify_signed_identity(
+                headers,
+                public_key=self._identity_pubkey,
+                audience=self._identity_aud,
+                leeway=self._identity_leeway,
+            )
         ident = caller_identity.resolve_identity(
             headers,
             validate_token=token_validator,
             transport_trusted=transport_trusted,
             superadmin_emails=self._sa_emails,
+            signed_claims=signed_claims,
+            require_signed=self._require_signed,
         )
         ctx_token = caller_identity.caller_ctx.set(ident)
         try:
