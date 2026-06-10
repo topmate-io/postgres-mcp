@@ -112,8 +112,6 @@ def _sanitize_error(error: str) -> str:
         return "Database temporarily unavailable. Please try again in a moment."
     if "timeout" in e_lower or "cancel" in e_lower:
         return "Query took too long. Try a more specific query with filters or a LIMIT clause."
-    if "duplicate" in e_lower:
-        return "Duplicate entry — this record already exists."
     # Generic fallback — don't leak internals
     logger.debug("Sanitized error (original): %s", error)
     return "An unexpected error occurred. Please try again or refine your query."
@@ -729,59 +727,6 @@ class CORSMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_cors)
-
-
-class BearerTokenMiddleware:
-    """ASGI middleware that requires a Bearer token for non-health-check requests.
-
-    Reads the expected token from the AUTH_TOKEN env var.
-    If AUTH_TOKEN is empty/unset, all traffic is allowed (backwards compatible).
-    Health check paths are always exempt.
-    """
-
-    HEALTH_PATHS = {"/", "/health", "/healthz"}
-
-    def __init__(self, app):
-        self.app = app
-        self._token = os.getenv("AUTH_TOKEN", "").strip()
-
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
-    async def __call__(self, scope, receive, send):
-        if not self._token or scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = self._get_path(scope)
-        if path in self.HEALTH_PATHS:
-            await self.app(scope, receive, send)
-            return
-
-        # Check Authorization header
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        auth = headers.get(b"authorization", b"").decode("latin-1")
-        if auth == f"Bearer {self._token}":
-            await self.app(scope, receive, send)
-            return
-
-        logger.warning("Rejected request: invalid or missing Bearer token (path=%s)", scope.get("path", ""))
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                [b"content-type", b"application/json"],
-                [b"www-authenticate", b"Bearer"],
-            ],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"error":"unauthorized","message":"Valid Bearer token required"}',
-        })
 
 
 class RateLimiterMiddleware:
