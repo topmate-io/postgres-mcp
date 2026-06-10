@@ -1152,23 +1152,46 @@ class HealthCheckMiddleware:
                 )
                 return
 
-            # Health endpoint with database check
+            # Readiness (k8s readinessProbe + ALB target healthcheck): CHEAP —
+            # checks in-memory pool state only, never acquires a pooled
+            # connection. The old live `SELECT 1` queued behind a saturated pool
+            # past the probe timeout, flipping the pod NotReady and dropping all
+            # Service endpoints exactly when busiest (S6 self-DoS).
             if method == "GET" and path == "/health":
+                if db_connection.pool is not None and db_connection.is_valid:
+                    status_code = 200
+                    body = b'{"status":"healthy"}'
+                else:
+                    status_code = 503
+                    body = b'{"status":"unhealthy","reason":"Database pool not ready"}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status_code,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"cache-control", b"no-store"],
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            # Diagnostic ONLY (not wired to any probe): live connectivity check.
+            if method == "GET" and path == "/health/db":
                 try:
                     if db_connection.pool is None:
                         status_code = 503
                         body = b'{"status":"unhealthy","reason":"Database pool not ready"}'
                     else:
-                        # Quick database connectivity check
                         async with db_connection.pool.connection() as conn:
                             await conn.execute("SELECT 1")
                         status_code = 200
                         body = b'{"status":"healthy"}'
                 except Exception as e:
-                    logger.debug(f"Health check failed: {e}")
+                    logger.debug(f"Health DB check failed: {e}")
                     status_code = 503
                     body = b'{"status":"unhealthy","reason":"Database connectivity check failed"}'
-
                 await send(
                     {
                         "type": "http.response.start",
