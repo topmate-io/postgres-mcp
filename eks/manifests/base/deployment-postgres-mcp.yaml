@@ -8,11 +8,15 @@ metadata:
     app.kubernetes.io/name: postgres-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  # S1: stateless /mcp (stateless_http=True) — inter-MCP callers use the
-  # session-free streamable path, so multiple replicas are safe behind the
-  # non-sticky in-cluster Service. External SSE callers keep ALB lb_cookie
-  # stickiness. Requires the db-mcp POSTGRES_MCP_TRANSPORT=streamable_http flip.
-  replicas: 3
+  # PINNED TO 1 — do not raise without a shared session store.
+  # External callers use the stateful /sse transport, whose session_id->stream
+  # map is in-memory per pod. ALB lb_cookie stickiness does NOT pin them: the
+  # EventSource GET and the message POSTs are separate requests that never replay
+  # the AWSALB cookie, so with >1 replica ~50% of POSTs land on the wrong pod
+  # (404 "Could not find session") and the client handshake times out at 30s.
+  # Re-enable scale-out only after external callers move to the stateless /mcp
+  # (streamable_http) path OR /sse sessions are backed by a shared store (Redis).
+  replicas: 1
   selector:
     matchLabels:
       app: postgres-mcp
