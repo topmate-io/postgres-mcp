@@ -1228,6 +1228,52 @@ class HealthCheckMiddleware:
         await self.app(scope, receive, send)
 
 
+def build_dual_transport_router(mcp_server):
+    """ASGI app serving one FastMCP server over BOTH transports — SSE at
+    ``/sse`` + ``/messages`` and Streamable-HTTP at ``/mcp`` — while driving the
+    Streamable-HTTP session manager's lifespan.
+
+    FastMCP's ``streamable_http_app()`` runs ``session_manager.run()`` inside its
+    own app lifespan, but dispatching to that app per-request (below) bypasses
+    that lifespan, so the streamable-HTTP task group is never started and every
+    ``/mcp`` request 500s with "Task group is not initialized" (LOOP-511). SSE
+    has no app-level lifespan (it is per-connection), so only the Streamable-HTTP
+    session manager needs starting here.
+    """
+    sse_app = mcp_server.sse_app()
+    http_app = mcp_server.streamable_http_app()  # lazily creates session_manager
+    session_cm: dict[str, Any] = {"ctx": None}
+
+    async def route_by_transport(scope, receive, send):
+        """Route to SSE or Streamable-HTTP by path; drive the Streamable-HTTP
+        session manager on the ASGI lifespan."""
+        if scope["type"] == "lifespan":
+            while True:
+                message = await receive()
+                if message["type"] == "lifespan.startup":
+                    try:
+                        session_cm["ctx"] = mcp_server.session_manager.run()
+                        await session_cm["ctx"].__aenter__()
+                    except Exception as exc:  # pragma: no cover
+                        await send({"type": "lifespan.startup.failed", "message": str(exc)})
+                    else:
+                        await send({"type": "lifespan.startup.complete"})
+                elif message["type"] == "lifespan.shutdown":
+                    if session_cm["ctx"] is not None:
+                        await session_cm["ctx"].__aexit__(None, None, None)
+                        session_cm["ctx"] = None
+                    await send({"type": "lifespan.shutdown.complete"})
+                    return
+            return  # pragma: no cover
+        path = scope.get("path", "")
+        if path == "/mcp" or path.startswith("/mcp/"):
+            await http_app(scope, receive, send)
+        else:
+            await sse_app(scope, receive, send)
+
+    return route_by_transport
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -1321,22 +1367,13 @@ async def main():
         )
 
         import uvicorn
-        from starlette.applications import Starlette
-        from starlette.routing import Route, Mount
 
-        # Expose both SSE and Streamable HTTP transports
-        # SSE at /sse + /messages (for Claude Code's type:"sse" config)
-        # Streamable HTTP at /mcp (for newer MCP clients)
-        sse_app = mcp.sse_app()
-        http_app = mcp.streamable_http_app()
-
-        async def route_by_transport(scope, receive, send):
-            """Route to SSE or Streamable HTTP based on path."""
-            path = scope.get("path", "")
-            if path == "/mcp" or path.startswith("/mcp/"):
-                await http_app(scope, receive, send)
-            else:
-                await sse_app(scope, receive, send)
+        # Expose both SSE (/sse + /messages, for Claude Code's type:"sse") and
+        # Streamable-HTTP (/mcp, for newer MCP clients) from one FastMCP server.
+        # build_dual_transport_router also starts the Streamable-HTTP session
+        # manager's lifespan, which the previous inline router skipped → every
+        # /mcp request 500'd with "Task group is not initialized" (LOOP-511).
+        route_by_transport = build_dual_transport_router(mcp)
 
         # Middleware stack (outermost → innermost):
         # 0. RequestIDMiddleware — assigns correlation ID to every request
