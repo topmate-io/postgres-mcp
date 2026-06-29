@@ -42,8 +42,12 @@ from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
 from . import caller_identity
 
-# Initialize FastMCP with default settings
-mcp = FastMCP("postgres-mcp")
+# S1: stateless_http makes the Streamable-HTTP (/mcp) session manager stateless
+# so postgres-mcp can run multiple replicas behind the non-sticky in-cluster
+# Service. The SSE (/sse) path stays session-bound (external callers unaffected);
+# the inter-MCP db-mcp client must therefore use /mcp (POSTGRES_MCP_TRANSPORT=
+# streamable_http) once replicas>1. json_response returns JSON on /mcp (mirrors db-mcp).
+mcp = FastMCP("postgres-mcp", stateless_http=True, json_response=True)
 
 # Constants
 PG_STAT_STATEMENTS = "pg_stat_statements"
@@ -112,8 +116,6 @@ def _sanitize_error(error: str) -> str:
         return "Database temporarily unavailable. Please try again in a moment."
     if "timeout" in e_lower or "cancel" in e_lower:
         return "Query took too long. Try a more specific query with filters or a LIMIT clause."
-    if "duplicate" in e_lower:
-        return "Duplicate entry — this record already exists."
     # Generic fallback — don't leak internals
     logger.debug("Sanitized error (original): %s", error)
     return "An unexpected error occurred. Please try again or refine your query."
@@ -124,7 +126,7 @@ def format_error_response(error: str) -> ResponseType:
     return format_text_response(f"Error: {_sanitize_error(error)}")
 
 
-@mcp.tool(description="List all schemas in the database")
+@mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
 async def list_schemas() -> ResponseType:
     """List all schemas in the database."""
     try:
@@ -150,7 +152,7 @@ async def list_schemas() -> ResponseType:
         return format_error_response(str(e))
 
 
-@mcp.tool(description="List objects in a schema")
+@mcp.tool(description="List objects in a schema", annotations=types.ToolAnnotations(readOnlyHint=True))
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
@@ -218,7 +220,7 @@ async def list_objects(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Show detailed information about a database object")
+@mcp.tool(description="Show detailed information about a database object", annotations=types.ToolAnnotations(readOnlyHint=True))
 async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
@@ -351,7 +353,7 @@ async def get_object_details(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.")
+@mcp.tool(description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.", annotations=types.ToolAnnotations(readOnlyHint=True))
 async def explain_query(
     sql: str = Field(description="SQL query to explain"),
     analyze: bool = Field(
@@ -446,7 +448,7 @@ async def execute_sql(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Analyze frequently executed queries in the database and recommend optimal indexes")
+@mcp.tool(description="Analyze frequently executed queries in the database and recommend optimal indexes", annotations=types.ToolAnnotations(readOnlyHint=True))
 @validate_call
 async def analyze_workload_indexes(
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
@@ -467,7 +469,7 @@ async def analyze_workload_indexes(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes")
+@mcp.tool(description="Analyze a list of (up to 10) SQL queries and recommend optimal indexes", annotations=types.ToolAnnotations(readOnlyHint=True))
 @validate_call
 async def analyze_query_indexes(
     queries: list[str] = Field(description="List of Query strings to analyze"),
@@ -504,7 +506,8 @@ async def analyze_query_indexes(
     "- buffer - checks for buffer cache hit rates for indexes and tables\n"
     "- constraint - checks for invalid constraints\n"
     "- all - runs all checks\n"
-    "You can optionally specify a single health check or a comma-separated list of health checks. The default is 'all' checks."
+    "You can optionally specify a single health check or a comma-separated list of health checks. The default is 'all' checks.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def analyze_db_health(
     health_type: str = Field(
@@ -526,6 +529,7 @@ async def analyze_db_health(
 @mcp.tool(
     name="get_top_queries",
     description=f"Reports the slowest or most resource-intensive queries using data from the '{PG_STAT_STATEMENTS}' extension.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_top_queries(
     sort_by: str = Field(
@@ -557,6 +561,7 @@ async def get_top_queries(
     name="get_topmate_schema_guide",
     description="Returns Topmate database schema reference with table descriptions, key columns, "
     "common filters, and pre-built SQL query templates for GMV, bookings, and user metrics.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_topmate_schema_guide() -> ResponseType:
     """Get Topmate database schema guide and SQL patterns.
@@ -574,6 +579,7 @@ async def get_topmate_schema_guide() -> ResponseType:
     name="get_topmate_troubleshooting_guide",
     description="Provides troubleshooting guidance for common SQL issues when querying Topmate database. "
     "Covers slow queries, incorrect results, complex aggregations, booking queries, and user metrics.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_topmate_troubleshooting_guide() -> ResponseType:
     """Get troubleshooting guide for Topmate SQL queries.
@@ -593,6 +599,7 @@ async def get_topmate_troubleshooting_guide() -> ResponseType:
     description="Provides comprehensive business logic patterns and SQL query guidance for complex scenarios. "
     "Fetches from Topmate Logic Hub API (requires TOPMATE_LOGIC_HUB_BASE_URL and TOPMATE_LOGIC_HUB_API_KEY environment variables). "
     "Returns business logic patterns, rules, and SQL query guidance.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_business_logic_patterns() -> ResponseType:
     """Get business logic patterns and SQL guidance from Topmate Logic Hub.
@@ -729,59 +736,6 @@ class CORSMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_cors)
-
-
-class BearerTokenMiddleware:
-    """ASGI middleware that requires a Bearer token for non-health-check requests.
-
-    Reads the expected token from the AUTH_TOKEN env var.
-    If AUTH_TOKEN is empty/unset, all traffic is allowed (backwards compatible).
-    Health check paths are always exempt.
-    """
-
-    HEALTH_PATHS = {"/", "/health", "/healthz"}
-
-    def __init__(self, app):
-        self.app = app
-        self._token = os.getenv("AUTH_TOKEN", "").strip()
-
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
-    async def __call__(self, scope, receive, send):
-        if not self._token or scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-
-        path = self._get_path(scope)
-        if path in self.HEALTH_PATHS:
-            await self.app(scope, receive, send)
-            return
-
-        # Check Authorization header
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        auth = headers.get(b"authorization", b"").decode("latin-1")
-        if auth == f"Bearer {self._token}":
-            await self.app(scope, receive, send)
-            return
-
-        logger.warning("Rejected request: invalid or missing Bearer token (path=%s)", scope.get("path", ""))
-        await send({
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                [b"content-type", b"application/json"],
-                [b"www-authenticate", b"Bearer"],
-            ],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": b'{"error":"unauthorized","message":"Valid Bearer token required"}',
-        })
 
 
 class RateLimiterMiddleware:
@@ -998,6 +952,16 @@ class CallerIdentityMiddleware:
         self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
         self._sa_emails = caller_identity.superadmin_emails_from_env()
         self._sa_tokens = caller_identity.superadmin_tokens_from_env()
+        # G1/G3 signed-identity gate (default off).
+        self._require_signed = caller_identity.require_signed_identity_from_env()
+        self._identity_pubkey = caller_identity.identity_jwt_public_key_from_env()
+        self._identity_aud = caller_identity.identity_jwt_audience_from_env()
+        self._identity_leeway = caller_identity.identity_jwt_leeway_from_env()
+        if self._require_signed and not self._identity_pubkey:
+            logger.critical(
+                "REQUIRE_SIGNED_IDENTITY=true but no IDENTITY_JWT_PUBLIC_KEY[_PATH] "
+                "configured; all trusted-transport callers will be rejected (fail-closed)."
+            )
 
     def _get_path(self, scope):
         path = scope.get("path", "")
@@ -1029,11 +993,30 @@ class CallerIdentityMiddleware:
         transport_trusted = caller_identity.is_transport_trusted(
             headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens
         )
+        # P2: pre-resolve a Tier-2 galactus token OFF the event loop so the
+        # blocking HTTP call doesn't freeze the single replica; hand
+        # resolve_identity a memoized validator so it stays pure/sync.
+        scheme, cred = caller_identity.parse_auth(headers)
+        token_validator = caller_identity.validate_token
+        if not transport_trusted and scheme == "token" and cred:
+            _profile = await caller_identity.validate_token_async(cred)
+            token_validator = lambda _t, _p=_profile: _p  # noqa: E731
+        # G1/G3: verify the signed identity JWT (CPU-only) when the gate is on.
+        signed_claims = None
+        if self._require_signed:
+            signed_claims = caller_identity.verify_signed_identity(
+                headers,
+                public_key=self._identity_pubkey,
+                audience=self._identity_aud,
+                leeway=self._identity_leeway,
+            )
         ident = caller_identity.resolve_identity(
             headers,
-            validate_token=caller_identity.validate_token,
+            validate_token=token_validator,
             transport_trusted=transport_trusted,
             superadmin_emails=self._sa_emails,
+            signed_claims=signed_claims,
+            require_signed=self._require_signed,
         )
         ctx_token = caller_identity.caller_ctx.set(ident)
         try:
@@ -1169,23 +1152,46 @@ class HealthCheckMiddleware:
                 )
                 return
 
-            # Health endpoint with database check
+            # Readiness (k8s readinessProbe + ALB target healthcheck): CHEAP —
+            # checks in-memory pool state only, never acquires a pooled
+            # connection. The old live `SELECT 1` queued behind a saturated pool
+            # past the probe timeout, flipping the pod NotReady and dropping all
+            # Service endpoints exactly when busiest (S6 self-DoS).
             if method == "GET" and path == "/health":
+                if db_connection.pool is not None and db_connection.is_valid:
+                    status_code = 200
+                    body = b'{"status":"healthy"}'
+                else:
+                    status_code = 503
+                    body = b'{"status":"unhealthy","reason":"Database pool not ready"}'
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status_code,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"cache-control", b"no-store"],
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            # Diagnostic ONLY (not wired to any probe): live connectivity check.
+            if method == "GET" and path == "/health/db":
                 try:
                     if db_connection.pool is None:
                         status_code = 503
                         body = b'{"status":"unhealthy","reason":"Database pool not ready"}'
                     else:
-                        # Quick database connectivity check
                         async with db_connection.pool.connection() as conn:
                             await conn.execute("SELECT 1")
                         status_code = 200
                         body = b'{"status":"healthy"}'
                 except Exception as e:
-                    logger.debug(f"Health check failed: {e}")
+                    logger.debug(f"Health DB check failed: {e}")
                     status_code = 503
                     body = b'{"status":"unhealthy","reason":"Database connectivity check failed"}'
-
                 await send(
                     {
                         "type": "http.response.start",
@@ -1261,9 +1267,11 @@ async def main():
 
     # Add the query tool with a description appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(execute_sql, description="Execute any SQL query")
+        mcp.add_tool(execute_sql, description="Execute any SQL query",
+                     annotations=types.ToolAnnotations(readOnlyHint=False))
     else:
-        mcp.add_tool(execute_sql, description="Execute a read-only SQL query")
+        mcp.add_tool(execute_sql, description="Execute a read-only SQL query",
+                     annotations=types.ToolAnnotations(readOnlyHint=True))
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 

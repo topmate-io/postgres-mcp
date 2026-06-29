@@ -7,7 +7,10 @@ metadata:
     app: postgres-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  minAvailable: 1
+  # INFRA: maxUnavailable scales with replica count and allows draining 1 of N
+  # during consolidation; minAvailable:1 at replicas:1 blocked ALL voluntary
+  # eviction (disruptionsAllowed=0) — a SPOF amplifier now that we run >1 replica.
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: postgres-mcp
@@ -21,7 +24,7 @@ metadata:
     app: db-mcp-server
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  minAvailable: 1
+  maxUnavailable: 1
   selector:
     matchLabels:
       app: db-mcp-server

@@ -11,7 +11,12 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: postgres-mcp
-  # SSE sessions are in-memory; single replica until Redis session store is wired.
+  # PINNED TO 1 — the stateful /sse transport keeps sessions in-memory per pod,
+  # and ALB lb_cookie stickiness is ineffective for SSE MCP clients (the separate
+  # GET/POST requests don't replay the cookie). With >1 replica ~50% of message
+  # POSTs hit the wrong pod (404 "Could not find session") and the handshake
+  # times out at 30s. Keep min=max=1 until external callers use the stateless
+  # /mcp path or /sse sessions are backed by a shared store (Redis).
   minReplicas: 1
   maxReplicas: 1
   metrics:

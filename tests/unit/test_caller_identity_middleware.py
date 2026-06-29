@@ -10,6 +10,13 @@ import postgres_mcp.caller_identity as ci
 from postgres_mcp.server import CallerIdentityMiddleware
 
 
+def _areturn(value):
+    """Build an async validate_token_async stub returning ``value`` (P2)."""
+    async def _f(token):
+        return value
+    return _f
+
+
 class _Recorder:
     def __init__(self):
         self.called = False
@@ -92,10 +99,9 @@ async def test_trusted_expert_is_403(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_untrusted_user_token_expert_is_403(monkeypatch):
-    monkeypatch.setattr(
-        ci, "validate_token",
-        lambda t: {"email": "x@topmate.io", "username": "x", "primary_user_type": "expert"},
-    )
+    _profile = {"email": "x@topmate.io", "username": "x", "primary_user_type": "expert"}
+    monkeypatch.setattr(ci, "validate_token", lambda t: _profile)
+    monkeypatch.setattr(ci, "validate_token_async", _areturn(_profile))
     inner = _Recorder()
     mw = CallerIdentityMiddleware(inner)
     statuses = await _run(
@@ -108,10 +114,9 @@ async def test_untrusted_user_token_expert_is_403(monkeypatch):
 @pytest.mark.asyncio
 async def test_untrusted_superadmin_via_allowlist_passes(monkeypatch):
     monkeypatch.setenv("SUPERADMIN_EMAILS", "admin@topmate.io")
-    monkeypatch.setattr(
-        ci, "validate_token",
-        lambda t: {"email": "admin@topmate.io", "username": "admin", "primary_user_type": "follower"},
-    )
+    _profile = {"email": "admin@topmate.io", "username": "admin", "primary_user_type": "follower"}
+    monkeypatch.setattr(ci, "validate_token", lambda t: _profile)
+    monkeypatch.setattr(ci, "validate_token_async", _areturn(_profile))
     inner = _Recorder()
     mw = CallerIdentityMiddleware(inner)
     statuses = await _run(
@@ -124,6 +129,7 @@ async def test_untrusted_superadmin_via_allowlist_passes(monkeypatch):
 @pytest.mark.asyncio
 async def test_invalid_token_is_401(monkeypatch):
     monkeypatch.setattr(ci, "validate_token", lambda t: None)
+    monkeypatch.setattr(ci, "validate_token_async", _areturn(None))
     inner = _Recorder()
     mw = CallerIdentityMiddleware(inner)
     statuses = await _run(

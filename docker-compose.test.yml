@@ -1,0 +1,76 @@
+# Local verification rig for the 2026-06-10 MCP remediation (LOOP-305 / spec_09).
+# Brings up redis + a throwaway seeded postgres + both MCPs wired together so the
+# auth/scoping findings (G1/G2/G3/P1) can be smoke-tested end-to-end. NEVER point
+# this at the prod replica — the seed exists so the G2 cross-join is observable.
+#
+#   docker compose -f docker-compose.test.yml build
+#   docker compose -f docker-compose.test.yml up -d
+#   bash tests/smoke/run_smoke.sh
+#   docker compose -f docker-compose.test.yml down -v
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--maxmemory", "200mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  testdb:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: topmate_test
+    volumes:
+      - ./tests/fixtures/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d topmate_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  postgres-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      testdb:
+        condition: service_healthy
+    environment:
+      DATABASE_URI: postgresql://postgres:postgres@testdb:5432/topmate_test
+      ACCESS_MODE: restricted
+      AUTH_TOKEN: test-shared-token
+      SUPERADMIN_EMAILS: admin@topmate.io
+      ALLOWED_IPS: 0.0.0.0/0
+      CALLER_SCOPE_ENABLED: "true"
+      # G1 stays OFF here (Loop signing not wired) — verifies flag-off behavior.
+      REQUIRE_SIGNED_IDENTITY: "false"
+    command: ["--transport=sse", "--sse-host=0.0.0.0", "--sse-port=8000", "--access-mode=restricted"]
+    ports:
+      - "8000:8000"
+
+  db-mcp:
+    build:
+      context: ../topmate-db-mcp-server
+      dockerfile: Dockerfile
+    depends_on:
+      - postgres-mcp
+      - redis
+    environment:
+      PORT: "9000"
+      HOST: 0.0.0.0
+      TRANSPORT: sse
+      CALLER_SCOPE_ENABLED: "true"
+      AUTH_TOKEN: test-shared-token
+      SUPERADMIN_EMAILS: admin@topmate.io
+      POSTGRES_MCP_URL: http://postgres-mcp:8000/mcp
+      POSTGRES_MCP_TRANSPORT: streamable_http
+      REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_MAX_REQUESTS: "1000"
+      RATE_LIMIT_WINDOW_SECONDS: "60"
+      REQUIRE_SIGNED_IDENTITY: "false"
+      LLM_PROVIDER: openrouter
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+    ports:
+      - "9000:9000"

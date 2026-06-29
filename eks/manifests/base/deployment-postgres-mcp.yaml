@@ -8,8 +8,14 @@ metadata:
     app.kubernetes.io/name: postgres-mcp
     app.kubernetes.io/part-of: topmate-mcp
 spec:
-  # Single replica: SSE sessions are in-memory, multi-replica requires
-  # shared session store or sticky sessions (ALB lb_cookie + client cookie support)
+  # PINNED TO 1 — do not raise without a shared session store.
+  # External callers use the stateful /sse transport, whose session_id->stream
+  # map is in-memory per pod. ALB lb_cookie stickiness does NOT pin them: the
+  # EventSource GET and the message POSTs are separate requests that never replay
+  # the AWSALB cookie, so with >1 replica ~50% of POSTs land on the wrong pod
+  # (404 "Could not find session") and the client handshake times out at 30s.
+  # Re-enable scale-out only after external callers move to the stateless /mcp
+  # (streamable_http) path OR /sse sessions are backed by a shared store (Redis).
   replicas: 1
   selector:
     matchLabels:
@@ -51,6 +57,15 @@ spec:
               value: "sse"
             - name: PORT
               value: "8000"
+            # POOL: per-replica psycopg pool sizing (tunable without rebuild).
+            # ⚠ Raise DB_POOL_MAX_SIZE (e.g. 30) only after verifying RDS
+            # max_connections + pg_stat_activity headroom (replica shared w/ Django).
+            - name: DB_POOL_MIN_SIZE
+              value: "5"
+            - name: DB_POOL_MAX_SIZE
+              value: "20"
+            - name: DB_POOL_TIMEOUT
+              value: "10.0"
             - name: TOPMATE_LOGIC_HUB_BASE_URL
               valueFrom:
                 secretKeyRef:
@@ -93,13 +108,26 @@ spec:
                   name: topmate-bi-secrets
                   key: superadmin-tokens
                   optional: true
+            # --- G1/G3: Loop-signed identity JWT (verify side) ---
+            # Flip REQUIRE_SIGNED_IDENTITY to "true" only after Loop ships signing
+            # (sends X-Identity-JWT). See docs/LOOP_SIGNED_IDENTITY_CONTRACT.md.
+            - name: REQUIRE_SIGNED_IDENTITY
+              value: "false"
+            - name: IDENTITY_JWT_AUDIENCE
+              value: "topmate-mcp"
+            - name: IDENTITY_JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: identity-jwt-public-key
+                  optional: true
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "100m"
-            limits:
               memory: "512Mi"
               cpu: "500m"
+            limits:
+              memory: "1Gi"
+              cpu: "1500m"   # S1: raise the 0.5-vCPU cap so each replica can drive its pool
           livenessProbe:
             httpGet:
               path: /healthz

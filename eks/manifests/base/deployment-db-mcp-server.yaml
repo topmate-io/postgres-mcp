@@ -53,7 +53,7 @@ spec:
             - name: POSTGRES_MCP_URL
               value: "http://postgres-mcp-service.postgres-mcp.svc:80/postgres-mcp"
             - name: POSTGRES_MCP_TRANSPORT
-              value: "sse"
+              value: "streamable_http"  # S1: stateless /mcp path so postgres-mcp can scale out
             - name: POSTGRES_MCP_TIMEOUT
               value: "60"
             # --- Additional databases (optional - set URLs when postgres-mcp pods are deployed for each) ---
@@ -221,6 +221,19 @@ spec:
                 secretKeyRef:
                   name: topmate-bi-secrets
                   key: superadmin-tokens
+                  optional: true
+            # --- G1/G3: Loop-signed identity JWT (verify side) ---
+            # Flip REQUIRE_SIGNED_IDENTITY to "true" only after Loop ships signing
+            # (sends X-Identity-JWT). See docs/LOOP_SIGNED_IDENTITY_CONTRACT.md.
+            - name: REQUIRE_SIGNED_IDENTITY
+              value: "false"
+            - name: IDENTITY_JWT_AUDIENCE
+              value: "topmate-mcp"
+            - name: IDENTITY_JWT_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: topmate-bi-secrets
+                  key: identity-jwt-public-key
                   optional: true
             # --- OAuth 2.1 (Claude.ai Custom Connector) ---
             - name: OAUTH_CLIENT_ID

@@ -22,7 +22,14 @@ spec:
       labels:
         app: redis
         app.kubernetes.io/name: redis
+      annotations:
+        # INFRA: don't let Karpenter evict the single Redis (cache + rate-limiter
+        # + single-flight store) mid-flight during node consolidation.
+        karpenter.sh/do-not-disrupt: "true"
     spec:
+      # INFRA: keep Redis off spot capacity so it isn't reclaimed.
+      nodeSelector:
+        karpenter.sh/capacity-type: on-demand
       containers:
         - name: redis
           image: redis:7-alpine

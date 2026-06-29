@@ -1,6 +1,7 @@
 """SQL driver adapter for PostgreSQL connections."""
 
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -85,12 +86,20 @@ class DbConnPool:
         await self.close()
 
         try:
-            # Configure connection pool with appropriate settings
+            # POOL (S1/POOL): env-configurable sizing. Defaults raise the old
+            # min=2/max=15 modestly to min=5/max=20. ⚠ Before raising
+            # DB_POOL_MAX_SIZE further (e.g. to 30), verify RDS headroom:
+            # `SHOW max_connections;` + `SELECT count(*) FROM pg_stat_activity;`
+            # on the replica — maxReplicas(5) x max must stay well under free conns
+            # (the replica is shared with Django topmate-api reads).
+            min_size = int(os.getenv("DB_POOL_MIN_SIZE", "5"))
+            max_size = int(os.getenv("DB_POOL_MAX_SIZE", "20"))
+            pool_timeout = float(os.getenv("DB_POOL_TIMEOUT", "10.0"))
             self.pool = AsyncConnectionPool(
                 conninfo=url,
-                min_size=2,
-                max_size=15,
-                timeout=10.0,  # Raise PoolTimeout after 10s instead of hanging forever
+                min_size=min_size,
+                max_size=max_size,
+                timeout=pool_timeout,  # Raise PoolTimeout instead of hanging forever
                 open=False,  # Don't connect immediately, let's do it explicitly
                 kwargs={"connect_timeout": 10},  # DB-level connect timeout
             )

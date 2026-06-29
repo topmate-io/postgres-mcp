@@ -50,6 +50,12 @@ spec:
               value: "sse"
             - name: PORT
               value: "8000"
+            # POOL: keep these financial pods small so they do not consume RDS
+            # connections reserved for the scaled primary postgres-mcp.
+            - name: DB_POOL_MIN_SIZE
+              value: "2"
+            - name: DB_POOL_MAX_SIZE
+              value: "10"
             - name: ALLOWED_IPS
               valueFrom:
                 configMapKeyRef:

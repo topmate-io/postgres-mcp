@@ -30,6 +30,7 @@ validator in.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import hmac
 import logging
@@ -39,6 +40,7 @@ import time
 from typing import Callable
 
 import httpx
+import jwt
 
 logger = logging.getLogger(__name__)
 
@@ -63,26 +65,24 @@ def _scope_from_profile(p: dict) -> str:
     return "seeker"
 
 
-def validate_token(token: str) -> dict | None:
-    """Validate a Topmate Knox token against galactus /profile/.
-
-    Returns the profile dict on success, or ``None`` on any failure. Cached for
-    ``_TTL`` seconds (both hits and misses) so invalid tokens don't repeatedly
-    hit galactus either.
-    """
-    if not token:
-        return None
+def _cached_profile(token: str) -> tuple[bool, dict | None]:
+    """Return ``(hit, profile)`` from the 300s cache (hit=False => not cached)."""
     now = time.monotonic()
     with _cache_lock:
-        hit = _cache.get(token)
-        if hit and (now - hit[1]) < _TTL:
-            return hit[0]
+        entry = _cache.get(token)
+        if entry and (now - entry[1]) < _TTL:
+            return True, entry[0]
+    return False, None
+
+
+def _validate_token_blocking(token: str) -> dict | None:
+    """Blocking galactus /profile/ call + cache write. Run in a worker thread."""
     profile: dict | None = None
     try:
         resp = httpx.get(
             _GALACTUS_URL,
             headers={"Authorization": f"Token {token}", "Accept": "application/json"},
-            timeout=8.0,
+            timeout=2.5,
         )
         if resp.status_code == 200:
             profile = resp.json()
@@ -90,8 +90,33 @@ def validate_token(token: str) -> dict | None:
         logger.warning("galactus validation error: %s", e)
         profile = None
     with _cache_lock:
-        _cache[token] = (profile, now)
+        _cache[token] = (profile, time.monotonic())
     return profile
+
+
+def validate_token(token: str) -> dict | None:
+    """Validate a Topmate Knox token against galactus /profile/ (sync, cached 300s).
+
+    Kept synchronous for back-compat and the pure ``resolve_identity`` contract.
+    The async ASGI path uses :func:`validate_token_async` so the blocking HTTP
+    call doesn't freeze the single postgres-mcp replica's event loop (P2).
+    """
+    if not token:
+        return None
+    hit, profile = _cached_profile(token)
+    if hit:
+        return profile
+    return _validate_token_blocking(token)
+
+
+async def validate_token_async(token: str) -> dict | None:
+    """Validate a Knox token, offloaded off the event loop (P2). Cached 300s."""
+    if not token:
+        return None
+    hit, profile = _cached_profile(token)
+    if hit:
+        return profile
+    return await asyncio.to_thread(_validate_token_blocking, token)
 
 
 def parse_auth(headers: dict[bytes, bytes]) -> tuple[str | None, str | None]:
@@ -136,24 +161,55 @@ def resolve_identity(
     validate_token: Callable[[str], dict | None] = validate_token,
     transport_trusted: bool = False,
     superadmin_emails: set[str] | None = None,
+    signed_claims: dict | None = None,
+    require_signed: bool = False,
 ) -> dict:
     """Resolve the forwarded identity. Pure given ``validate_token`` + ``transport_trusted``.
 
-    See the module docstring for the resolution rules.
+    When ``require_signed`` (G1/G3): Tier-1 trust is granted ONLY by a verified
+    ``signed_claims``; identity is derived from the claims and a present X-User-*
+    header that disagrees forces ``INVALID``. Flag off (default) preserves the
+    legacy verbatim-header Tier-1 exactly. See the module docstring for the rules.
     """
     superadmin_emails = superadmin_emails or set()
     raw_scope = headers.get(b"x-user-scope")
     raw_scope_s = raw_scope.decode("latin-1").strip() if raw_scope else None
 
     # Hard rule #1: no X-User-Scope header => legacy => unchanged behavior.
-    if not raw_scope_s:
+    # Exception (G1/G3 hardening): under require_signed, a VERIFIED signature is
+    # authoritative even without the X-User-Scope routing header — fall through so
+    # the signed claim governs, rather than silently treating a signed request as
+    # legacy/unrestricted (defends against a Loop client that omits the header).
+    if not raw_scope_s and not (require_signed and signed_claims is not None):
         return {"scope": None, "username": None, "email": None, "raw_scope_header": None}
 
     hdr_username = (headers.get(b"x-user-username") or b"").decode("latin-1").strip() or None
     hdr_email = (headers.get(b"x-user-email") or b"").decode("latin-1").strip() or None
 
-    # Tier 1: trusted gateway (Loop/internal via shared secret) -> trust headers verbatim.
-    if transport_trusted:
+    # Tier 1: trusted gateway.
+    if require_signed:
+        # G1/G3: trust is granted ONLY by a verified signature. Derive identity
+        # from the claims; a present X-User-* header that disagrees forces INVALID
+        # (no header-alone escalation). No valid signature -> fall through to
+        # Tier-2 (a shared Bearer alone can no longer grant scope).
+        if signed_claims is not None:
+            claim_scope = signed_claims.get("scope")
+            claim_username = signed_claims.get("username")
+            claim_email = signed_claims.get("email")
+            scope = claim_scope if claim_scope in _VALID_SCOPES else INVALID
+            if (
+                (raw_scope_s is not None and raw_scope_s != claim_scope)
+                or (hdr_username is not None and hdr_username != claim_username)
+                or (hdr_email is not None and hdr_email != claim_email)
+            ):
+                scope = INVALID
+            return {
+                "scope": scope,
+                "username": claim_username,
+                "email": claim_email,
+                "raw_scope_header": raw_scope_s,
+            }
+    elif transport_trusted:
         scope = raw_scope_s if raw_scope_s in _VALID_SCOPES else INVALID
         return {
             "scope": scope,
@@ -202,3 +258,85 @@ def superadmin_emails_from_env() -> set[str]:
 
 def superadmin_tokens_from_env() -> set[str]:
     return {t.strip() for t in os.getenv("SUPERADMIN_TOKENS", "").split(",") if t.strip()}
+
+
+# --- G1/G3: signed-identity gate (env-driven, mirrors db-mcp) ----------------
+
+def require_signed_identity_from_env() -> bool:
+    return os.getenv("REQUIRE_SIGNED_IDENTITY", "false").lower() == "true"
+
+
+def identity_jwt_audience_from_env() -> str:
+    return os.getenv("IDENTITY_JWT_AUDIENCE", "topmate-mcp")
+
+
+def identity_jwt_leeway_from_env() -> int:
+    try:
+        return int(os.getenv("IDENTITY_JWT_LEEWAY_SECONDS", "60"))
+    except ValueError:
+        return 60
+
+
+_pubkey_cache: dict = {}
+
+
+def identity_jwt_public_key_from_env() -> str | None:
+    """RSA public-key PEM from IDENTITY_JWT_PUBLIC_KEY or *_PATH (cached)."""
+    inline = os.getenv("IDENTITY_JWT_PUBLIC_KEY")
+    if inline:
+        return inline
+    path = os.getenv("IDENTITY_JWT_PUBLIC_KEY_PATH")
+    if not path:
+        return None
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None
+    cached = _pubkey_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    try:
+        with open(path) as f:
+            pem = f.read()
+    except OSError:
+        return None
+    _pubkey_cache[path] = (mtime, pem)
+    return pem
+
+
+def verify_signed_identity(
+    headers: dict[bytes, bytes],
+    *,
+    public_key: str | None,
+    audience: str,
+    leeway: int = 60,
+) -> dict | None:
+    """Verify a Loop-signed RS256 identity JWT from the ``X-Identity-JWT`` header.
+
+    Returns normalized claims ``{scope, username, email}`` on a valid signature,
+    or ``None`` on ANY failure. Pure CPU — no network (G1/G3).
+    """
+    if public_key is None:
+        return None
+    raw = headers.get(b"x-identity-jwt")
+    if not raw:
+        return None
+    token = raw.decode("latin-1").strip()
+    if not token:
+        return None
+    try:
+        claims = jwt.decode(
+            token,
+            public_key,
+            algorithms=["RS256"],  # pinned — no alg-confusion downgrade
+            audience=audience,
+            leeway=leeway,
+            options={"require": ["exp", "aud"]},
+        )
+    except Exception as e:
+        logger.warning("identity JWT verification failed: %s", e)
+        return None
+    scope = claims.get("scope")
+    if scope not in _VALID_SCOPES:
+        return None
+    return {"scope": scope, "username": claims.get("username"), "email": claims.get("email")}
