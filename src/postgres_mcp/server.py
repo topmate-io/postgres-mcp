@@ -29,6 +29,7 @@ from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .asgi_utils import get_client_ip
 from .asgi_utils import get_path
+from .audit import AuditLogMiddleware
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
@@ -1364,20 +1365,24 @@ async def main():
         # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
         # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer (legacy, retired in M4)
         # 3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
-        # 4. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
-        # 5. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
-        # 6. HealthCheckMiddleware — ALB health probes
-        # 7. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
+        # 4. AuditLogMiddleware — one JSON audit line per request (LOOP-664 M1)
+        # 5. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
+        # 6. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
+        # 7. HealthCheckMiddleware — ALB health probes
+        # 8. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
         wrapped_app = RequestIDMiddleware(
             CORSMiddleware(
                 IPAllowlistMiddleware(
                     PersonAuthMiddleware(
-                        CallerIdentityMiddleware(
-                            RateLimiterMiddleware(
-                                HealthCheckMiddleware(SSEKeepAliveMiddleware(route_by_transport, interval=15)),
-                                max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
-                                window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
-                            )
+                        AuditLogMiddleware(
+                            CallerIdentityMiddleware(
+                                RateLimiterMiddleware(
+                                    HealthCheckMiddleware(SSEKeepAliveMiddleware(route_by_transport, interval=15)),
+                                    max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                                    window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
+                                )
+                            ),
+                            get_request_id=lambda: _request_id_var.get(""),
                         )
                     )
                 )
@@ -1385,7 +1390,7 @@ async def main():
         )
         logger.info(
             "Applied middleware stack: RequestID + CORS + IPAllowlist(+TokenBypass) + "
-            "PersonAuth + CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
+            "PersonAuth + AuditLog + CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
         )
 
         # Attach request-ID filter to root logger so all log records include it
