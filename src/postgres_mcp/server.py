@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import uuid
+from collections import OrderedDict
 from enum import Enum
 from typing import Any
 from typing import List
@@ -26,6 +27,8 @@ from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 from . import caller_identity
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
+from .asgi_utils import get_client_ip
+from .asgi_utils import get_path
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
@@ -33,6 +36,7 @@ from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
 from .person_auth import PersonAuthMiddleware
+from .person_auth import current_person
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
@@ -751,47 +755,45 @@ class CORSMiddleware:
 
 
 class RateLimiterMiddleware:
-    """Per-IP token-bucket rate limiter for postgres-mcp.
+    """Token-bucket rate limiter keyed on authenticated identity (LOOP-664 M1).
 
-    Exempt paths: health checks.
-    If a client exceeds the rate, returns 429 with Retry-After header.
+    Bucket key: ``person:<name>`` when PersonAuth resolved a caller, else
+    ``ip:<client-ip>``. Identity comes ONLY from the current_person contextvar
+    (set post-authentication) — never from request headers, which callers
+    control. The bucket store is a bounded LRU (MAX_BUCKETS) so many distinct
+    keys over a pod's lifetime cannot grow memory without bound.
+
+    Exempt paths: health checks. Exceeding the rate returns 429 + Retry-After.
     """
 
     HEALTH_PATHS = {"/", "/health", "/healthz"}
+    MAX_BUCKETS = 1024
 
     def __init__(self, app, max_requests: int = 30, window_seconds: int = 60):
         self.app = app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self._buckets: dict[str, list] = {}  # ip -> [tokens, last_refill]
+        self._buckets: OrderedDict[str, list] = OrderedDict()  # key -> [tokens, last_refill]
         self._lock = asyncio.Lock()
 
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix) :] or "/"
-        return path
+    def _bucket_key(self, scope) -> str:
+        person = current_person.get()
+        if person:
+            return f"person:{person}"
+        return f"ip:{get_client_ip(scope)}"
 
-    def _get_client_ip(self, scope):
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        cf_ip = headers.get(b"cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.decode("latin-1").strip()
-        xff = headers.get(b"x-forwarded-for")
-        if xff:
-            return xff.decode("latin-1").split(",")[0].strip()
-        client = scope.get("client")
-        return client[0] if client else "unknown"
-
-    def _consume(self, ip: str) -> bool:
+    def _consume(self, key: str) -> bool:
         import time as _time
 
         now = _time.monotonic()
-        bucket = self._buckets.get(ip)
+        bucket = self._buckets.get(key)
         if bucket is None:
+            while len(self._buckets) >= self.MAX_BUCKETS:
+                self._buckets.popitem(last=False)  # evict least-recently-used key
             bucket = [float(self.max_requests), now]
-            self._buckets[ip] = bucket
+            self._buckets[key] = bucket
+        else:
+            self._buckets.move_to_end(key)
         tokens, last = bucket
         elapsed = now - last
         refill_rate = self.max_requests / self.window_seconds
@@ -805,13 +807,13 @@ class RateLimiterMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            path = self._get_path(scope)
+            path = get_path(scope)
             if path not in self.HEALTH_PATHS:
-                ip = self._get_client_ip(scope)
+                key = self._bucket_key(scope)
                 async with self._lock:
-                    allowed = self._consume(ip)
+                    allowed = self._consume(key)
                 if not allowed:
-                    logger.warning("Rate limit exceeded for %s", ip)
+                    logger.warning("Rate limit exceeded for %s", key)
                     await send(
                         {
                             "type": "http.response.start",
