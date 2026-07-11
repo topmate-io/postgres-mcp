@@ -56,6 +56,12 @@ def test_non_sha256_digest_raises_value_error():
         PersonTokenRegistry(raw='{"dharsan": "short"}')
 
 
+def test_duplicate_token_digest_across_names_raises():
+    shared = _digest("tok-shared")
+    with pytest.raises(ValueError, match="duplicate token digest"):
+        PersonTokenRegistry(raw=f'{{"alice": "{shared}", "bob": "{shared}"}}')
+
+
 def test_two_people_resolve_independently():
     raw = f'{{"dharsan": "{_digest("tok-a")}", "ci-bot": "{_digest("tok-b")}"}}'
     reg = PersonTokenRegistry(raw=raw)
