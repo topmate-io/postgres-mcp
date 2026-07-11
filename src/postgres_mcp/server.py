@@ -1392,6 +1392,13 @@ async def main():
 
         async def route_by_transport(scope, receive, send):
             """Route to SSE or Streamable HTTP based on path."""
+            if scope["type"] == "lifespan":
+                # The streamable-HTTP app's Starlette lifespan is what starts
+                # its StreamableHTTPSessionManager task group — without it every
+                # /mcp request 500s ("Task group is not initialized"). sse_app
+                # has no lifespan hook, so it needs no startup event.
+                await http_app(scope, receive, send)
+                return
             path = scope.get("path", "")
             if path == "/mcp" or path.startswith("/mcp/"):
                 await http_app(scope, receive, send)
