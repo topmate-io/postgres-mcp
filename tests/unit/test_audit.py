@@ -129,3 +129,154 @@ async def test_health_paths_not_audited(caplog):
     mw = AuditLogMiddleware(_Inner(), get_request_id=lambda: "req-h")
     await _run(mw, _scope(0, path="/postgres-mcp/health", method="GET"))
     assert _audit_lines(caplog) == []
+
+
+# --- Multi-chunk replay / exhaustion / exception-path coverage (LOOP-664 M1 review fix) ---
+
+
+class _RecordingInner:
+    """Drains the (replayed) body, recording every message it receives."""
+
+    def __init__(self):
+        self.received = []
+
+    async def __call__(self, scope, receive, send):
+        while True:
+            message = await receive()
+            self.received.append(message)
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+
+class _ExtraReceiveInner:
+    """Drains the body, then calls receive() one extra time (e.g. to check
+    for disconnect) after the buffered/replayed messages are exhausted."""
+
+    def __init__(self):
+        self.extra_message = None
+
+    async def __call__(self, scope, receive, send):
+        while True:
+            message = await receive()
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                break
+        self.extra_message = await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+
+class _RaisingInner:
+    """Drains the body then raises, simulating a mid-request failure."""
+
+    async def __call__(self, scope, receive, send):
+        while True:
+            message = await receive()
+            if message["type"] != "http.request" or not message.get("more_body", False):
+                break
+        raise RuntimeError("boom")
+
+
+async def _run_multi(mw, scope, messages):
+    """Like _run, but feeds a sequence of raw receive() messages instead of a
+    single body chunk. Once `messages` is exhausted, falls through to a live
+    http.disconnect — mirroring real ASGI server behavior."""
+    delivered = []
+    idx = {"i": 0}
+
+    async def send(message):
+        delivered.append(message)
+
+    async def receive():
+        i = idx["i"]
+        idx["i"] += 1
+        if i < len(messages):
+            return messages[i]
+        return {"type": "http.disconnect"}
+
+    await mw(scope, receive, send)
+    return delivered
+
+
+@pytest.mark.asyncio
+async def test_multi_chunk_body_is_reassembled_and_replayed(caplog):
+    caplog.set_level("INFO", logger="postgres_mcp.audit")
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "explain_query", "arguments": {"sql": "SELECT 1", "verbose": True}},
+        }
+    ).encode()
+    mid = len(body) // 2
+    messages = [
+        {"type": "http.request", "body": body[:mid], "more_body": True},
+        {"type": "http.request", "body": body[mid:], "more_body": False},
+    ]
+    inner = _RecordingInner()
+    mw = AuditLogMiddleware(inner, get_request_id=lambda: "req-multi")
+
+    delivered = await _run_multi(mw, _scope(len(body)), messages)
+
+    lines = _audit_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["rpc_method"] == "tools/call"
+    assert lines[0]["tool"] == "explain_query"
+    assert lines[0]["arg_keys"] == ["sql", "verbose"]
+
+    # The inner app received the exact replayed chunks, in order, untouched.
+    assert inner.received == messages
+    assert delivered[0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_replay_exhaustion_falls_through_to_live_receive(caplog):
+    caplog.set_level("INFO", logger="postgres_mcp.audit")
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "list_schemas", "arguments": {}},
+        }
+    ).encode()
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    inner = _ExtraReceiveInner()
+    mw = AuditLogMiddleware(inner, get_request_id=lambda: "req-exhaust")
+
+    delivered = await _run_multi(mw, _scope(len(body)), messages)
+
+    # The extra receive() call, beyond the buffered/replayed messages, must
+    # fall through to the next live message rather than hang or raise
+    # StopIteration.
+    assert inner.extra_message == {"type": "http.disconnect"}
+    assert delivered[0]["status"] == 200
+    lines = _audit_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["tool"] == "list_schemas"
+
+
+@pytest.mark.asyncio
+async def test_audit_line_emitted_when_inner_app_raises(caplog):
+    caplog.set_level("INFO", logger="postgres_mcp.audit")
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {"name": "analyze_db_health", "arguments": {}},
+        }
+    ).encode()
+    mw = AuditLogMiddleware(_RaisingInner(), get_request_id=lambda: "req-raise")
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await _run(mw, _scope(len(body)), body)
+
+    # The audit line is still emitted exactly once even though the inner app
+    # raised mid-request, and the exception propagates to the caller.
+    lines = _audit_lines(caplog)
+    assert len(lines) == 1
+    assert lines[0]["tool"] == "analyze_db_health"
+    assert lines[0]["status"] == 0
