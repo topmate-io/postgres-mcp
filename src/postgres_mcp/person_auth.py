@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import os
+from typing import ClassVar
 
 from .asgi_utils import get_path
 
@@ -79,7 +80,7 @@ class PersonAuthMiddleware:
     Rollback: PERSON_AUTH_ENABLED=false -> exact pre-M1 behavior.
     """
 
-    HEALTH_PATHS = {"/", "/health", "/healthz"}
+    HEALTH_PATHS: ClassVar[set[str]] = {"/", "/health", "/healthz"}
 
     def __init__(self, app, registry: PersonTokenRegistry | None = None, enabled: bool | None = None):
         self.app = app
@@ -90,6 +91,9 @@ class PersonAuthMiddleware:
         if self.enabled and (self.registry is None or len(self.registry) == 0):
             raise ValueError("PERSON_AUTH_ENABLED=true but PERSON_TOKENS is empty — refusing to start an effectively unauthenticated server")
         if self.enabled:
+            # Narrow for type-checkers: constructor above already raised if
+            # self.registry were None while enabled.
+            assert self.registry is not None
             logger.info("PersonAuth enabled: %d person token(s) loaded", len(self.registry))
 
     async def __call__(self, scope, receive, send):

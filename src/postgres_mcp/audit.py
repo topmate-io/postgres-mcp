@@ -16,6 +16,7 @@ pass through untouched and are logged without rpc/tool detail.
 import json
 import logging
 import time
+from typing import ClassVar
 
 from .asgi_utils import get_client_ip
 from .asgi_utils import get_path
@@ -51,7 +52,7 @@ def _parse_jsonrpc(body: bytes) -> tuple[str, str, list[str]]:
 class AuditLogMiddleware:
     """ASGI middleware emitting one audit line per request (LOOP-664 M1)."""
 
-    HEALTH_PATHS = {"/", "/health", "/healthz"}
+    HEALTH_PATHS: ClassVar[set[str]] = {"/", "/health", "/healthz"}
 
     def __init__(self, app, get_request_id=None):
         self.app = app
