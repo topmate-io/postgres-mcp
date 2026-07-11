@@ -1256,6 +1256,44 @@ class HealthCheckMiddleware:
         await self.app(scope, receive, send)
 
 
+def build_middleware_stack(terminal_app):
+    """Compose the full perimeter chain around a terminal ASGI app.
+
+    Single source of truth for middleware ORDER — main() and the integration
+    tests both use this, so an ordering regression cannot slip past tests.
+
+    Middleware stack (outermost → innermost):
+    0. RequestIDMiddleware — assigns correlation ID to every request
+    1. CORSMiddleware — handles OPTIONS preflight + CORS headers
+    2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer (legacy, retired in M4)
+    3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
+    4. AuditLogMiddleware — one JSON audit line per request (LOOP-664 M1)
+    5. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
+    6. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
+    7. HealthCheckMiddleware — ALB health probes
+    8. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
+    """
+    return RequestIDMiddleware(
+        CORSMiddleware(
+            IPAllowlistMiddleware(
+                PersonAuthMiddleware(
+                    AuditLogMiddleware(
+                        CallerIdentityMiddleware(
+                            RateLimiterMiddleware(
+                                HealthCheckMiddleware(SSEKeepAliveMiddleware(terminal_app, interval=15)),
+                                max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                                window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
+                            )
+                        ),
+                        get_request_id=lambda: _request_id_var.get(""),
+                    ),
+                    get_request_id=lambda: _request_id_var.get(""),
+                )
+            )
+        )
+    )
+
+
 async def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="PostgreSQL MCP Server")
@@ -1360,34 +1398,7 @@ async def main():
             else:
                 await sse_app(scope, receive, send)
 
-        # Middleware stack (outermost → innermost):
-        # 0. RequestIDMiddleware — assigns correlation ID to every request
-        # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
-        # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer (legacy, retired in M4)
-        # 3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
-        # 4. AuditLogMiddleware — one JSON audit line per request (LOOP-664 M1)
-        # 5. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
-        # 6. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
-        # 7. HealthCheckMiddleware — ALB health probes
-        # 8. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
-        wrapped_app = RequestIDMiddleware(
-            CORSMiddleware(
-                IPAllowlistMiddleware(
-                    PersonAuthMiddleware(
-                        AuditLogMiddleware(
-                            CallerIdentityMiddleware(
-                                RateLimiterMiddleware(
-                                    HealthCheckMiddleware(SSEKeepAliveMiddleware(route_by_transport, interval=15)),
-                                    max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
-                                    window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
-                                )
-                            ),
-                            get_request_id=lambda: _request_id_var.get(""),
-                        )
-                    )
-                )
-            )
-        )
+        wrapped_app = build_middleware_stack(route_by_transport)
         logger.info(
             "Applied middleware stack: RequestID + CORS + IPAllowlist(+TokenBypass) + "
             "PersonAuth + AuditLog + CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"

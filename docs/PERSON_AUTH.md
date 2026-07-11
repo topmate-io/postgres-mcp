@@ -16,15 +16,33 @@ Per-person bearer tokens replacing the shared AUTH_TOKEN for team callers.
    `aws secretsmanager create-secret --name topmate/postgres-mcp/person-tokens --secret-string '{...}'`
    (or `put-secret-value` to rotate/add).
 3. `./eks/deploy.sh` — refreshes the `postgres-mcp-secrets` k8s secret.
-4. Flip `PERSON_AUTH_ENABLED` to `"true"` in `eks/manifests/base/deployment-postgres-mcp.yaml`, apply, verify:
+4. **STOP — before flipping the flag in prod:** flipping `PERSON_AUTH_ENABLED=true` immediately
+   401s ANY caller that doesn't send a personal/service bearer token. TODAY that includes
+   **db-mcp-server's inter-MCP client**, which sends NO `Authorization` header (it is an
+   in-cluster caller trusted by IP/network today). Do NOT flip this flag in prod until:
+   1. a service token has been minted for db-mcp (`python scripts/mint_person_token.py db-mcp-server`),
+   2. that token's digest is added to the `PERSON_TOKENS` secret, and
+   3. db-mcp-server's client is configured to send `Authorization: Bearer <service token>`.
+
+   Flip `PERSON_AUTH_ENABLED` to `"true"` in `eks/manifests/base/deployment-postgres-mcp.yaml`, apply, verify:
    - no token → 401; personal token → 200; old shared AUTH_TOKEN alone → still passes the IP-allowlist bypass but NOT PersonAuth (401) — expected: humans move to personal tokens now, AUTH_TOKEN fully retires in M4.
 5. Each caller adds `Authorization: Bearer <personal token>` in their MCP client config,
    AND switches to the streamable-HTTP endpoint — `https://mcp.gabbanext.run/postgres-mcp/mcp`
    (`"type": "http"` in `.mcp.json`) instead of `/sse`. `/mcp` is the promoted path from M1 on;
    `/sse` keeps working for stragglers until it is removed in M4.
 
+## Scope of the flag
+`PERSON_AUTH_ENABLED` gates ONLY the auth check (the 401-or-pass decision in
+`PersonAuthMiddleware`). The audit logging (`AuditLogMiddleware`) and the
+rewritten person-keyed, LRU-bounded rate limiter (`RateLimiterMiddleware`) are
+**active regardless of the flag** — they shipped as part of M1 and are not
+behind a rollback toggle. Reverting either of those requires a code revert,
+not an env var flip.
+
 ## Rollback
-Set `PERSON_AUTH_ENABLED` to `"false"` and re-apply the deployment. Exact pre-M1 behavior returns.
+Set `PERSON_AUTH_ENABLED` to `"false"` and re-apply the deployment. Exact pre-M1 behavior returns
+for the auth check specifically (see "Scope of the flag" above — audit logging and the rate
+limiter are unaffected by this toggle either way).
 
 ## Revoking one person
 Remove their entry from the AWS secret, re-run deploy.sh, restart the deployment.
@@ -32,3 +50,6 @@ Remove their entry from the AWS secret, re-run deploy.sh, restart the deployment
 ## Audit trail
 Every request logs one JSON line on logger `postgres_mcp.audit` (person, tool,
 arg keys, status, duration, request_id). Argument values are never logged.
+401 denials from `PersonAuthMiddleware` are also logged as JSON lines on the
+same `postgres_mcp.audit` logger, marked with `"denied": "person_auth"`
+(person is always `""` since the caller never authenticated).

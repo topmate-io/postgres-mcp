@@ -20,9 +20,15 @@ import logging
 import os
 from typing import ClassVar
 
+from .asgi_utils import get_client_ip
 from .asgi_utils import get_path
 
 logger = logging.getLogger(__name__)
+
+# NOTE: emit the 401 audit line via logging.getLogger("postgres_mcp.audit")
+# directly rather than importing postgres_mcp.audit — that module imports
+# this one (person_auth), so importing it back here would be circular.
+_audit_logger = logging.getLogger("postgres_mcp.audit")
 
 # Resolved person name for the current request ("" when PersonAuth is off).
 current_person: contextvars.ContextVar[str] = contextvars.ContextVar("current_person", default="")
@@ -47,6 +53,8 @@ class PersonTokenRegistry:
         for name, digest in parsed.items():
             if not isinstance(digest, str) or len(digest) != 64:
                 raise ValueError(f"PERSON_TOKENS[{name!r}] must be a 64-char sha256 hex digest")
+            if digest.lower() in self._by_digest:
+                raise ValueError(f"PERSON_TOKENS: duplicate token digest shared by {self._by_digest[digest.lower()]!r} and {name!r}")
             self._by_digest[digest.lower()] = str(name)
 
     def __len__(self) -> int:
@@ -82,11 +90,12 @@ class PersonAuthMiddleware:
 
     HEALTH_PATHS: ClassVar[set[str]] = {"/", "/health", "/healthz"}
 
-    def __init__(self, app, registry: PersonTokenRegistry | None = None, enabled: bool | None = None):
+    def __init__(self, app, registry: PersonTokenRegistry | None = None, enabled: bool | None = None, get_request_id=None):
         self.app = app
         if enabled is None:
             enabled = os.getenv("PERSON_AUTH_ENABLED", "false").strip().lower() == "true"
         self.enabled = enabled
+        self._get_request_id = get_request_id or (lambda: "")
         self.registry = registry if registry is not None else (PersonTokenRegistry() if enabled else None)
         if self.enabled and (self.registry is None or len(self.registry) == 0):
             raise ValueError("PERSON_AUTH_ENABLED=true but PERSON_TOKENS is empty — refusing to start an effectively unauthenticated server")
@@ -114,6 +123,19 @@ class PersonAuthMiddleware:
 
         if person is None:
             logger.warning("PersonAuth: rejected request to %s (missing/unknown token)", scope.get("path", ""))
+            audit_line = {
+                "request_id": self._get_request_id(),
+                "person": "",
+                "client_ip": get_client_ip(scope),
+                "path": scope.get("path", ""),
+                "rpc_method": "",
+                "tool": "",
+                "arg_keys": [],
+                "status": 401,
+                "duration_ms": 0.0,
+                "denied": "person_auth",
+            }
+            _audit_logger.info(json.dumps(audit_line, separators=(",", ":")))
             await send(
                 {
                     "type": "http.response.start",

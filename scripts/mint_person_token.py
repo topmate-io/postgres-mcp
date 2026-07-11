@@ -10,6 +10,7 @@ Secrets Manager secret topmate/postgres-mcp/person-tokens.
 """
 
 import hashlib
+import json
 import secrets
 import sys
 
@@ -22,7 +23,7 @@ def main() -> int:
     token = secrets.token_urlsafe(32)
     digest = hashlib.sha256(token.encode()).hexdigest()
     print(f"Raw token for {name} (share once, never store):\n  {token}\n")
-    print(f'PERSON_TOKENS fragment:\n  "{name}": "{digest}"')
+    print(f"PERSON_TOKENS fragment:\n  {json.dumps(name)}: {json.dumps(digest)}")
     return 0
 
 
