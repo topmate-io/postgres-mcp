@@ -16,7 +16,7 @@
 - No new runtime dependencies — stdlib only.
 - The legacy `AUTH_TOKEN` bypass in `IPAllowlistMiddleware` (server.py:818-928) is NOT removed in M1 — it is retired in M4. Rollback contract: `PERSON_AUTH_ENABLED=false` restores exact pre-M1 behavior.
 - `PERSON_AUTH_ENABLED` defaults to `"false"`; the production manifest ships it `"false"` and it is flipped manually after tokens are distributed (see Task 5 runbook).
-- New middleware follows the existing pure-ASGI style (no Starlette BaseHTTPMiddleware), including the `_get_path` ALB-prefix-strip and `_get_client_ip` CF-Connecting-IP → XFF[0] → scope.client conventions copied verbatim from siblings.
+- New middleware follows the existing pure-ASGI style (no Starlette BaseHTTPMiddleware). The ALB-prefix-strip and client-IP-extraction conventions live in ONE place: `src/postgres_mcp/asgi_utils.py` (`get_path(scope)`, `get_client_ip(scope)`, created in Task 1). New/rewritten middleware imports these — never copy them. (`IPAllowlistMiddleware` keeps its private copies; it is retired wholesale in M4.)
 - Health paths `{"/", "/health", "/healthz"}` are always exempt from auth, rate limiting, and audit.
 - Argument VALUES are never written to logs — only sorted argument key names (spec §3.9 redaction rule).
 - All tests use the repo's raw-ASGI harness conventions from `tests/unit/test_caller_identity_middleware.py` (`_Recorder`, `_scope`, `_run`, `@pytest.mark.asyncio`).
@@ -28,11 +28,13 @@
 
 **Files:**
 - Create: `src/postgres_mcp/person_auth.py`
+- Create: `src/postgres_mcp/asgi_utils.py`
 - Test: `tests/unit/test_person_auth.py`
+- Test: `tests/unit/test_asgi_utils.py`
 
 **Interfaces:**
-- Consumes: nothing (leaf module; must NOT import `postgres_mcp.server` — the server imports it).
-- Produces: `PersonTokenRegistry(raw: str | None = None)` with `.verify(presented: str) -> str | None` and `__len__`; module-level `current_person: contextvars.ContextVar[str]` (default `""`). Task 2 wraps these in middleware; Task 3 reads `current_person`.
+- Consumes: nothing (leaf modules; must NOT import `postgres_mcp.server` — the server imports them).
+- Produces: `PersonTokenRegistry(raw: str | None = None)` with `.verify(presented: str) -> str | None` and `__len__`; module-level `current_person: contextvars.ContextVar[str]` (default `""`); `asgi_utils.get_path(scope) -> str` (ALB prefix strip) and `asgi_utils.get_client_ip(scope) -> str` (CF-Connecting-IP → XFF[0] → scope client → `"unknown"`). Task 2 wraps the registry in middleware; Tasks 2-4 import the asgi helpers; Task 3 reads `current_person`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -104,12 +106,88 @@ def test_two_people_resolve_independently():
     assert len(reg) == 2
 ```
 
+```python
+# tests/unit/test_asgi_utils.py
+"""Tests for the shared ASGI scope helpers (LOOP-664 M1)."""
+
+from postgres_mcp.asgi_utils import get_client_ip
+from postgres_mcp.asgi_utils import get_path
+
+
+def test_get_path_strips_known_alb_prefixes():
+    assert get_path({"path": "/postgres-mcp/mcp"}) == "/mcp"
+    assert get_path({"path": "/db-mcp/health"}) == "/health"
+    assert get_path({"path": "/postgres-mcp"}) == "/"
+    assert get_path({"path": "/mcp"}) == "/mcp"
+    assert get_path({}) == ""
+
+
+def test_get_client_ip_prefers_cloudflare_header():
+    scope = {
+        "headers": [(b"cf-connecting-ip", b"1.2.3.4"), (b"x-forwarded-for", b"5.6.7.8, 9.9.9.9")],
+        "client": ("10.0.0.1", 1),
+    }
+    assert get_client_ip(scope) == "1.2.3.4"
+
+
+def test_get_client_ip_falls_back_to_first_xff_entry():
+    scope = {"headers": [(b"x-forwarded-for", b"5.6.7.8, 9.9.9.9")], "client": ("10.0.0.1", 1)}
+    assert get_client_ip(scope) == "5.6.7.8"
+
+
+def test_get_client_ip_falls_back_to_scope_client_then_unknown():
+    assert get_client_ip({"headers": [], "client": ("10.0.0.1", 1)}) == "10.0.0.1"
+    assert get_client_ip({"headers": []}) == "unknown"
+```
+
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `uv run pytest tests/unit/test_person_auth.py -v`
-Expected: FAIL — `ModuleNotFoundError: No module named 'postgres_mcp.person_auth'`
+Run: `uv run pytest tests/unit/test_person_auth.py tests/unit/test_asgi_utils.py -v`
+Expected: FAIL — `ModuleNotFoundError` for both `postgres_mcp.person_auth` and `postgres_mcp.asgi_utils`
 
 - [ ] **Step 3: Write the implementation**
+
+```python
+# src/postgres_mcp/asgi_utils.py
+"""Shared ASGI scope helpers for the perimeter middleware chain (LOOP-664 M1).
+
+One canonical copy of the ALB ingress-prefix strip and the client-IP
+extraction (CF-Connecting-IP -> X-Forwarded-For[0] -> ASGI client) used by
+PersonAuth, AuditLog, and RateLimiter. IPAllowlistMiddleware keeps its
+private copies until it is retired wholesale in M4.
+
+Leaf module: must not import anything from postgres_mcp.
+"""
+
+ALB_PREFIXES = ("/postgres-mcp", "/db-mcp", "/instagram-mcp")
+
+
+def get_path(scope) -> str:
+    """Request path with known ALB ingress prefixes stripped."""
+    path = scope.get("path", "")
+    for prefix in ALB_PREFIXES:
+        if path.startswith(prefix):
+            return path[len(prefix):] or "/"
+    return path
+
+
+def get_client_ip(scope) -> str:
+    """Real client IP: CF-Connecting-IP > X-Forwarded-For[0] > ASGI client.
+
+    Traffic flows Client -> Cloudflare -> ALB -> Pod. CF-Connecting-IP is set
+    by Cloudflare and cannot be spoofed by the client; XFF[0] is the first
+    (client-set) entry — less trustworthy but works without Cloudflare.
+    """
+    headers = {name.lower(): value for name, value in scope.get("headers", [])}
+    cf_ip = headers.get(b"cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.decode("latin-1").strip()
+    xff = headers.get(b"x-forwarded-for")
+    if xff:
+        return xff.decode("latin-1").split(",")[0].strip()
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+```
 
 ```python
 # src/postgres_mcp/person_auth.py
@@ -182,14 +260,14 @@ class PersonTokenRegistry:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `uv run pytest tests/unit/test_person_auth.py -v`
-Expected: 9 passed
+Run: `uv run pytest tests/unit/test_person_auth.py tests/unit/test_asgi_utils.py -v`
+Expected: 13 passed
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/postgres_mcp/person_auth.py tests/unit/test_person_auth.py
-git commit -m "feat(auth): LOOP-664 M1 — per-person token registry"
+git add src/postgres_mcp/person_auth.py src/postgres_mcp/asgi_utils.py tests/unit/test_person_auth.py tests/unit/test_asgi_utils.py
+git commit -m "feat(auth): LOOP-664 M1 — per-person token registry + shared ASGI helpers"
 ```
 
 ---
@@ -345,6 +423,7 @@ Expected: FAIL — `ImportError: cannot import name 'PersonAuthMiddleware'`
 
 ```python
 # append to src/postgres_mcp/person_auth.py
+# (add `from .asgi_utils import get_path` to the module imports)
 
 
 class PersonAuthMiddleware:
@@ -375,19 +454,12 @@ class PersonAuthMiddleware:
         if self.enabled:
             logger.info("PersonAuth enabled: %d person token(s) loaded", len(self.registry))
 
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
     async def __call__(self, scope, receive, send):
         if not self.enabled or scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        if self._get_path(scope) in self.HEALTH_PATHS:
+        if get_path(scope) in self.HEALTH_PATHS:
             await self.app(scope, receive, send)
             return
 
@@ -604,7 +676,7 @@ Expected: `test_two_persons_behind_same_ip_have_separate_buckets`, `test_bucket_
 
 - [ ] **Step 3: Rewrite `RateLimiterMiddleware` in place**
 
-Replace the class at `src/postgres_mcp/server.py:741-815` with the code below, and add `from collections import OrderedDict` plus `from .person_auth import current_person` to the imports at the top of server.py. (`_consume` keeps the original's local `import time as _time` style.)
+Replace the class at `src/postgres_mcp/server.py:741-815` with the code below, and add `from collections import OrderedDict`, `from .person_auth import current_person`, and `from .asgi_utils import get_client_ip, get_path` to the imports at the top of server.py. (`_consume` keeps the original's local `import time as _time` style.)
 
 ```python
 class RateLimiterMiddleware:
@@ -629,29 +701,11 @@ class RateLimiterMiddleware:
         self._buckets: OrderedDict[str, list] = OrderedDict()  # key -> [tokens, last_refill]
         self._lock = asyncio.Lock()
 
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
-    def _get_client_ip(self, scope):
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        cf_ip = headers.get(b"cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.decode("latin-1").strip()
-        xff = headers.get(b"x-forwarded-for")
-        if xff:
-            return xff.decode("latin-1").split(",")[0].strip()
-        client = scope.get("client")
-        return client[0] if client else "unknown"
-
     def _bucket_key(self, scope) -> str:
         person = current_person.get()
         if person:
             return f"person:{person}"
-        return f"ip:{self._get_client_ip(scope)}"
+        return f"ip:{get_client_ip(scope)}"
 
     def _consume(self, key: str) -> bool:
         import time as _time
@@ -677,7 +731,7 @@ class RateLimiterMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            path = self._get_path(scope)
+            path = get_path(scope)
             if path not in self.HEALTH_PATHS:
                 key = self._bucket_key(scope)
                 async with self._lock:
@@ -887,6 +941,8 @@ import json
 import logging
 import time
 
+from .asgi_utils import get_client_ip
+from .asgi_utils import get_path
 from .person_auth import current_person
 
 logger = logging.getLogger("postgres_mcp.audit")
@@ -925,26 +981,8 @@ class AuditLogMiddleware:
         self.app = app
         self._get_request_id = get_request_id or (lambda: "")
 
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
-
-    def _get_client_ip(self, scope):
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        cf_ip = headers.get(b"cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.decode("latin-1").strip()
-        xff = headers.get(b"x-forwarded-for")
-        if xff:
-            return xff.decode("latin-1").split(",")[0].strip()
-        client = scope.get("client")
-        return client[0] if client else "unknown"
-
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or self._get_path(scope) in self.HEALTH_PATHS:
+        if scope["type"] != "http" or get_path(scope) in self.HEALTH_PATHS:
             await self.app(scope, receive, send)
             return
 
@@ -991,7 +1029,7 @@ class AuditLogMiddleware:
             line = {
                 "request_id": self._get_request_id(),
                 "person": current_person.get(),
-                "client_ip": self._get_client_ip(scope),
+                "client_ip": get_client_ip(scope),
                 "path": scope.get("path", ""),
                 "rpc_method": rpc_method,
                 "tool": tool,
@@ -1228,7 +1266,7 @@ Expected: all pass except (at most) the 2 pre-existing `tests/unit/explain` fail
 
 - [ ] **Step 2: Lint + types**
 
-Run: `uv run ruff check . && uv run pyright src/postgres_mcp/person_auth.py src/postgres_mcp/audit.py`
+Run: `uv run ruff check . && uv run pyright src/postgres_mcp/person_auth.py src/postgres_mcp/audit.py src/postgres_mcp/asgi_utils.py`
 Expected: no errors
 
 - [ ] **Step 3: Boot smoke test (flag off = legacy behavior)**
