@@ -182,10 +182,20 @@ if [ "$SKIP_SECRETS" = false ]; then
     exit 1
   }
 
+  PERSON_TOKENS_JSON=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/person-tokens \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "  WARN: topmate/postgres-mcp/person-tokens not found — PersonAuth (LOOP-664 M1) cannot be enabled."
+    echo "        Create it with: aws secretsmanager create-secret --name topmate/postgres-mcp/person-tokens \\"
+    echo "          --secret-string '{\"<name>\": \"<sha256-hex>\"}'   (mint entries via scripts/mint_person_token.py)"
+    PERSON_TOKENS_JSON=""
+  }
+
   kubectl create secret generic postgres-mcp-secrets \
     --from-literal=database-uri="${DATABASE_URI}" \
     --from-literal=logic-hub-url="${LOGIC_HUB_URL}" \
     --from-literal=logic-hub-api-key="${LOGIC_HUB_API_KEY}" \
+    --from-literal=person-tokens="${PERSON_TOKENS_JSON}" \
     -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 

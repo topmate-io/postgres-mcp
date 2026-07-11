@@ -89,6 +89,16 @@ spec:
                   name: topmate-bi-secrets
                   key: auth-token
                   optional: true
+            # LOOP-664 M1: per-person auth. Flip to "true" only after tokens
+            # are minted and distributed (see docs/PERSON_AUTH.md).
+            - name: PERSON_AUTH_ENABLED
+              value: "false"
+            - name: PERSON_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-mcp-secrets
+                  key: person-tokens
+                  optional: true
             # --- Caller-scoped access (Loop end-user identity forwarding) ---
             # Validates Authorization: Token <x> against galactus /profile/.
             # postgres-mcp is admin-only: any non-superadmin scope is 403'd.
