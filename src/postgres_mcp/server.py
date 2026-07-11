@@ -23,6 +23,7 @@ from pydantic import validate_call
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
+from . import caller_identity
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .database_health import DatabaseHealthTool
@@ -31,16 +32,16 @@ from .explain import ExplainPlanTool
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .person_auth import PersonAuthMiddleware
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
-from .topmate_business_logic import TopmateBuisnessLogic
 from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
-from . import caller_identity
+from .topmate_business_logic import TopmateBuisnessLogic
 
 # S1: stateless_http makes the Streamable-HTTP (/mcp) session manager stateless
 # so postgres-mcp can run multiple replicas behind the non-sticky in-cluster
@@ -111,8 +112,10 @@ def _sanitize_error(error: str) -> str:
         return "Permission denied for this operation."
     if "duplicate" in e_lower:
         return "Duplicate entry — this record already exists."
-    if any(k in e_lower for k in ("connection refused", "could not connect", "connection reset",
-                                   "name resolution", "network unreachable", "timeout expired")):
+    if any(
+        k in e_lower
+        for k in ("connection refused", "could not connect", "connection reset", "name resolution", "network unreachable", "timeout expired")
+    ):
         return "Database temporarily unavailable. Please try again in a moment."
     if "timeout" in e_lower or "cancel" in e_lower:
         return "Query took too long. Try a more specific query with filters or a LIMIT clause."
@@ -353,7 +356,10 @@ async def get_object_details(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.", annotations=types.ToolAnnotations(readOnlyHint=True))
+@mcp.tool(
+    description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
 async def explain_query(
     sql: str = Field(description="SQL query to explain"),
     analyze: bool = Field(
@@ -448,7 +454,10 @@ async def execute_sql(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Analyze frequently executed queries in the database and recommend optimal indexes", annotations=types.ToolAnnotations(readOnlyHint=True))
+@mcp.tool(
+    description="Analyze frequently executed queries in the database and recommend optimal indexes",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
 @validate_call
 async def analyze_workload_indexes(
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
@@ -673,6 +682,7 @@ class RequestIDMiddleware:
 
         token = _request_id_var.set(req_id)
         try:
+
             async def send_with_request_id(message):
                 if message["type"] == "http.response.start":
                     extra = [[b"x-request-id", req_id.encode()]]
@@ -713,16 +723,18 @@ class CORSMiddleware:
 
         # Preflight
         if method == "OPTIONS":
-            await send({
-                "type": "http.response.start",
-                "status": 204,
-                "headers": [
-                    [b"access-control-allow-origin", origin.encode()],
-                    [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
-                    [b"access-control-allow-headers", b"Authorization, Content-Type"],
-                    [b"access-control-max-age", b"86400"],
-                ],
-            })
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [
+                        [b"access-control-allow-origin", origin.encode()],
+                        [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
+                        [b"access-control-allow-headers", b"Authorization, Content-Type"],
+                        [b"access-control-max-age", b"86400"],
+                    ],
+                }
+            )
             await send({"type": "http.response.body", "body": b""})
             return
 
@@ -758,7 +770,7 @@ class RateLimiterMiddleware:
         path = scope.get("path", "")
         for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
-                return path[len(prefix):] or "/"
+                return path[len(prefix) :] or "/"
         return path
 
     def _get_client_ip(self, scope):
@@ -774,6 +786,7 @@ class RateLimiterMiddleware:
 
     def _consume(self, ip: str) -> bool:
         import time as _time
+
         now = _time.monotonic()
         bucket = self._buckets.get(ip)
         if bucket is None:
@@ -799,18 +812,22 @@ class RateLimiterMiddleware:
                     allowed = self._consume(ip)
                 if not allowed:
                     logger.warning("Rate limit exceeded for %s", ip)
-                    await send({
-                        "type": "http.response.start",
-                        "status": 429,
-                        "headers": [
-                            [b"content-type", b"application/json"],
-                            [b"retry-after", str(self.window_seconds).encode()],
-                        ],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"too_many_requests","message":"Rate limit exceeded"}',
-                    })
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 429,
+                            "headers": [
+                                [b"content-type", b"application/json"],
+                                [b"retry-after", str(self.window_seconds).encode()],
+                            ],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"error":"too_many_requests","message":"Rate limit exceeded"}',
+                        }
+                    )
                     return
         await self.app(scope, receive, send)
 
@@ -890,7 +907,7 @@ class IPAllowlistMiddleware:
         path = scope.get("path", "")
         for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
-                return path[len(prefix):] or "/"
+                return path[len(prefix) :] or "/"
         return path
 
     def _has_valid_bearer(self, scope) -> bool:
@@ -901,7 +918,7 @@ class IPAllowlistMiddleware:
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if not auth.startswith("Bearer "):
             return False
-        presented = auth[len("Bearer "):].strip()
+        presented = auth[len("Bearer ") :].strip()
         return bool(presented) and hmac.compare_digest(presented, self._auth_token)
 
     async def __call__(self, scope, receive, send):
@@ -914,15 +931,19 @@ class IPAllowlistMiddleware:
 
                 if not self._is_allowed(client_ip) and not self._has_valid_bearer(scope):
                     logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
-                    await send({
-                        "type": "http.response.start",
-                        "status": 403,
-                        "headers": [[b"content-type", b"application/json"]],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"forbidden","message":"IP not allowed"}',
-                    })
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 403,
+                            "headers": [[b"content-type", b"application/json"]],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"error":"forbidden","message":"IP not allowed"}',
+                        }
+                    )
                     return
 
         await self.app(scope, receive, send)
@@ -967,19 +988,23 @@ class CallerIdentityMiddleware:
         path = scope.get("path", "")
         for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
-                return path[len(prefix):] or "/"
+                return path[len(prefix) :] or "/"
         return path
 
     async def _deny(self, send, status, err, msg):
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [[b"content-type", b"application/json"]],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": f'{{"error":"{err}","message":"{msg}"}}'.encode(),
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [[b"content-type", b"application/json"]],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": f'{{"error":"{err}","message":"{msg}"}}'.encode(),
+            }
+        )
 
     async def __call__(self, scope, receive, send):
         if not self.enabled or scope["type"] != "http":
@@ -990,9 +1015,7 @@ class CallerIdentityMiddleware:
             return
 
         headers = {k.lower(): v for k, v in scope.get("headers", [])}
-        transport_trusted = caller_identity.is_transport_trusted(
-            headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens
-        )
+        transport_trusted = caller_identity.is_transport_trusted(headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens)
         # P2: pre-resolve a Tier-2 galactus token OFF the event loop so the
         # blocking HTTP call doesn't freeze the single replica; hand
         # resolve_identity a memoized validator so it stays pure/sync.
@@ -1072,7 +1095,7 @@ class SSEKeepAliveMiddleware:
 
             if message["type"] == "http.response.body":
                 # Start pinging after the first body chunk (SSE stream opened)
-                if response_started and ping_task is None and not message.get("more_body", True) is False:
+                if response_started and ping_task is None and message.get("more_body", True) is not False:
                     ping_task = asyncio.create_task(self._ping_loop(send))
                 await send(message)
                 return
@@ -1094,11 +1117,13 @@ class SSEKeepAliveMiddleware:
         while True:
             await asyncio.sleep(self.interval)
             try:
-                await send({
-                    "type": "http.response.body",
-                    "body": b":ping\n\n",
-                    "more_body": True,
-                })
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b":ping\n\n",
+                        "more_body": True,
+                    }
+                )
             except (OSError, BrokenPipeError, ConnectionResetError, RuntimeError):
                 # Connection closed or broken pipe, stop pinging
                 logger.debug("SSE ping loop ended: connection closed")
@@ -1128,7 +1153,7 @@ class HealthCheckMiddleware:
             # Set root_path so SSE transport includes the prefix in endpoint URLs
             for prefix in self.PATH_PREFIXES:
                 if path.startswith(prefix):
-                    path = path[len(prefix):] or "/"
+                    path = path[len(prefix) :] or "/"
                     scope = dict(scope, path=path, root_path=prefix)
                     break
 
@@ -1267,11 +1292,9 @@ async def main():
 
     # Add the query tool with a description appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(execute_sql, description="Execute any SQL query",
-                     annotations=types.ToolAnnotations(readOnlyHint=False))
+        mcp.add_tool(execute_sql, description="Execute any SQL query", annotations=types.ToolAnnotations(readOnlyHint=False))
     else:
-        mcp.add_tool(execute_sql, description="Execute a read-only SQL query",
-                     annotations=types.ToolAnnotations(readOnlyHint=True))
+        mcp.add_tool(execute_sql, description="Execute a read-only SQL query", annotations=types.ToolAnnotations(readOnlyHint=True))
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
@@ -1316,13 +1339,9 @@ async def main():
 
         # Configure transport security to allow all hosts (like eden_gardens' ALLOWED_HOSTS = "*")
         # This disables DNS rebinding protection for compatibility with load balancers and ingress
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
-        )
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
         import uvicorn
-        from starlette.applications import Starlette
-        from starlette.routing import Route, Mount
 
         # Expose both SSE and Streamable HTTP transports
         # SSE at /sse + /messages (for Claude Code's type:"sse" config)
@@ -1341,20 +1360,22 @@ async def main():
         # Middleware stack (outermost → innermost):
         # 0. RequestIDMiddleware — assigns correlation ID to every request
         # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
-        # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer
-        # 3. RateLimiterMiddleware — per-IP rate limiting
-        # 4. HealthCheckMiddleware — ALB health probes
-        # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
+        # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer (legacy, retired in M4)
+        # 3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
+        # 4. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
+        # 5. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
+        # 6. HealthCheckMiddleware — ALB health probes
+        # 7. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
         wrapped_app = RequestIDMiddleware(
             CORSMiddleware(
                 IPAllowlistMiddleware(
-                    CallerIdentityMiddleware(
-                        RateLimiterMiddleware(
-                            HealthCheckMiddleware(
-                                SSEKeepAliveMiddleware(route_by_transport, interval=15)
-                            ),
-                            max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
-                            window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
+                    PersonAuthMiddleware(
+                        CallerIdentityMiddleware(
+                            RateLimiterMiddleware(
+                                HealthCheckMiddleware(SSEKeepAliveMiddleware(route_by_transport, interval=15)),
+                                max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                                window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
+                            )
                         )
                     )
                 )
@@ -1362,7 +1383,7 @@ async def main():
         )
         logger.info(
             "Applied middleware stack: RequestID + CORS + IPAllowlist(+TokenBypass) + "
-            "CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
+            "PersonAuth + CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
         )
 
         # Attach request-ID filter to root logger so all log records include it

@@ -19,6 +19,8 @@ import json
 import logging
 import os
 
+from .asgi_utils import get_path
+
 logger = logging.getLogger(__name__)
 
 # Resolved person name for the current request ("" when PersonAuth is off).
@@ -63,3 +65,68 @@ class PersonTokenRegistry:
             if hmac.compare_digest(digest, known_digest):
                 matched = name
         return matched
+
+
+class PersonAuthMiddleware:
+    """ASGI middleware enforcing per-person bearer tokens (LOOP-664 M1).
+
+    Sits between IPAllowlistMiddleware and AuditLogMiddleware. When enabled,
+    every non-health HTTP request must carry ``Authorization: Bearer <token>``
+    where sha256(token) is a value in PERSON_TOKENS. On success the resolved
+    person name is exposed via ``current_person`` for the rate limiter
+    (identity keying) and the audit log.
+
+    Rollback: PERSON_AUTH_ENABLED=false -> exact pre-M1 behavior.
+    """
+
+    HEALTH_PATHS = {"/", "/health", "/healthz"}
+
+    def __init__(self, app, registry: PersonTokenRegistry | None = None, enabled: bool | None = None):
+        self.app = app
+        if enabled is None:
+            enabled = os.getenv("PERSON_AUTH_ENABLED", "false").strip().lower() == "true"
+        self.enabled = enabled
+        self.registry = registry if registry is not None else (PersonTokenRegistry() if enabled else None)
+        if self.enabled and (self.registry is None or len(self.registry) == 0):
+            raise ValueError("PERSON_AUTH_ENABLED=true but PERSON_TOKENS is empty — refusing to start an effectively unauthenticated server")
+        if self.enabled:
+            logger.info("PersonAuth enabled: %d person token(s) loaded", len(self.registry))
+
+    async def __call__(self, scope, receive, send):
+        if not self.enabled or scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        if get_path(scope) in self.HEALTH_PATHS:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {name.lower(): value for name, value in scope.get("headers", [])}
+        auth = headers.get(b"authorization", b"").decode("latin-1")
+        presented = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
+        # self.registry is guaranteed non-None when enabled (constructor raises
+        # otherwise); the extra check keeps type-checkers satisfied.
+        person = self.registry.verify(presented) if (presented and self.registry) else None
+
+        if person is None:
+            logger.warning("PersonAuth: rejected request to %s (missing/unknown token)", scope.get("path", ""))
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [[b"content-type", b"application/json"]],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b'{"error":"unauthorized","message":"Valid personal bearer token required"}',
+                }
+            )
+            return
+
+        token = current_person.set(person)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            current_person.reset(token)
