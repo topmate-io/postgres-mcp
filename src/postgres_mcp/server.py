@@ -935,31 +935,40 @@ class IPAllowlistMiddleware:
             return ""
         return auth[len("Bearer ") :].strip()
 
-    def _has_valid_bearer(self, scope) -> bool:
-        """Return True when the request carries a bearer that grants an IP bypass.
+    def _matches_auth_token(self, presented: str) -> bool:
+        """Constant-time check that ``presented`` equals the shared AUTH_TOKEN."""
+        return bool(self._auth_token) and bool(presented) and hmac.compare_digest(presented, self._auth_token)
 
-        Accepts either the shared static ``AUTH_TOKEN`` or any token the injected
-        ``PersonTokenRegistry`` recognises. Both comparisons are constant-time
-        (``hmac.compare_digest`` directly, and inside ``registry.verify``).
+    def _resolve_person(self, presented: str) -> "str | None":
+        """Return the person name for a valid per-person token, else None.
+
+        ``registry.verify`` scans every entry with ``hmac.compare_digest`` (no
+        early exit), so timing does not leak which token, if any, matched.
         """
-        presented = self._extract_bearer(scope)
-        if not presented:
-            return False
-        if self._auth_token and hmac.compare_digest(presented, self._auth_token):
-            return True
-        if self._person_registry is not None and self._person_registry.verify(presented) is not None:
-            return True
-        return False
+        if not presented or self._person_registry is None:
+            return None
+        return self._person_registry.verify(presented)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and self.allowed_networks is not None:
-            path = self._get_path(scope)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
+        # Resolve any presented credential once: use it both to grant IP bypass
+        # and to attribute the request in the audit trail. Resolving the person
+        # here (not just in PersonAuthMiddleware) means a person-token caller is
+        # named in the audit log even while PERSON_AUTH_ENABLED is off — the
+        # migration window where person tokens are live but enforcement is not.
+        presented = self._extract_bearer(scope)
+        person = self._resolve_person(presented)
+
+        if self.allowed_networks is not None:
+            path = self._get_path(scope)
             # Always allow health check paths (ALB probes)
             if path not in self.HEALTH_PATHS:
                 client_ip = self._get_client_ip(scope)
-
-                if not self._is_allowed(client_ip) and not self._has_valid_bearer(scope):
+                bypass = self._matches_auth_token(presented) or person is not None
+                if not self._is_allowed(client_ip) and not bypass:
                     logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
                     await send(
                         {
@@ -976,7 +985,17 @@ class IPAllowlistMiddleware:
                     )
                     return
 
-        await self.app(scope, receive, send)
+        # Attribute a person-token caller downstream. PersonAuthMiddleware (inner)
+        # sets the same value again when the flag is on; nested set/reset is
+        # LIFO-safe since this middleware wraps it.
+        if person is not None:
+            token = current_person.set(person)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                current_person.reset(token)
+        else:
+            await self.app(scope, receive, send)
 
 
 class CallerIdentityMiddleware:

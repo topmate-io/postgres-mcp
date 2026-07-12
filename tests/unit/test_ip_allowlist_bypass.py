@@ -12,6 +12,7 @@ import hashlib
 import pytest
 
 from postgres_mcp.person_auth import PersonTokenRegistry
+from postgres_mcp.person_auth import current_person
 from postgres_mcp.server import IPAllowlistMiddleware
 
 WHITELIST = "10.0.0.0/16"
@@ -146,3 +147,32 @@ async def test_health_path_exempt_regardless(env):
     mw = IPAllowlistMiddleware(inner, registry=_registry())
     assert await _run(mw, _scope(OUTSIDE_IP, path="/postgres-mcp/health")) == 200
     assert inner.called
+
+
+class _PersonRecorder:
+    def __init__(self):
+        self.person_seen = None
+
+    async def __call__(self, scope, receive, send):
+        self.person_seen = current_person.get()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+
+@pytest.mark.asyncio
+async def test_person_token_sets_current_person_for_attribution(env):
+    """A person-token caller is attributed downstream even with PersonAuth off."""
+    inner = _PersonRecorder()
+    mw = IPAllowlistMiddleware(inner, registry=_registry())
+    await _run(mw, _scope(OUTSIDE_IP, bearer="tok-alice"))
+    assert inner.person_seen == "alice"
+    assert current_person.get() == ""  # reset after the request
+
+
+@pytest.mark.asyncio
+async def test_auth_token_caller_not_attributed(env):
+    """AUTH_TOKEN grants access but carries no identity — person stays unset."""
+    inner = _PersonRecorder()
+    mw = IPAllowlistMiddleware(inner, registry=_registry())
+    await _run(mw, _scope(OUTSIDE_IP, bearer=AUTH_TOKEN))
+    assert inner.person_seen == ""
