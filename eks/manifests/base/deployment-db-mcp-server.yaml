@@ -56,6 +56,15 @@ spec:
               value: "streamable_http"  # S1: stateless /mcp path so postgres-mcp can scale out
             - name: POSTGRES_MCP_TIMEOUT
               value: "60"
+            # LOOP-664: bearer sent to postgres-mcp so this client keeps working
+            # once postgres-mcp enforces PERSON_AUTH_ENABLED=true. Raw service
+            # token (svc-db-mcp); optional so the pod starts before it exists.
+            - name: POSTGRES_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-mcp-secrets
+                  key: db-mcp-postgres-token
+                  optional: true
             # --- Additional databases (optional - set URLs when postgres-mcp pods are deployed for each) ---
             # - name: POSTGRES_MCP_KINGSMEAD_URL
             #   value: "http://kingsmead-mcp-service.postgres-mcp.svc:80/kingsmead-mcp"
