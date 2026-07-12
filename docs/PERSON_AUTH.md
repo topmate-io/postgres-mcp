@@ -3,11 +3,25 @@
 
 Per-person bearer tokens replacing the shared AUTH_TOKEN for team callers.
 
-## Config contract
+## Config contract — three independent knobs
 | Env | Meaning |
 |---|---|
-| `PERSON_AUTH_ENABLED` | `"true"` = every non-health request needs a personal token. Anything else = middleware is a no-op (rollback path). |
-| `PERSON_TOKENS` | JSON object `{"<name>": "<sha256 hex of raw token>"}`. Raw tokens are never stored server-side. |
+| `AUTH_TOKEN` | Shared static token. When set, a `Bearer <AUTH_TOKEN>` bypasses the IP allowlist (legacy; retired in M4). |
+| `PERSON_TOKENS` | JSON object `{"<name>": "<sha256 hex of raw token>"}`. Raw tokens are never stored server-side. When non-empty, a valid **person token also bypasses the IP allowlist** — a person token is a stronger, revocable per-person credential, so it grants the same network access `AUTH_TOKEN` does. This is active whenever the secret is populated, **independent of `PERSON_AUTH_ENABLED`**. |
+| `PERSON_AUTH_ENABLED` | `"true"` = `PersonAuthMiddleware` *requires* a valid person token on every non-health request (rejects AUTH_TOKEN-only and no-token callers with 401). Anything else = that enforcement is a no-op. |
+
+**How the two token knobs combine:** the IP allowlist (outer) admits a caller
+if their IP is whitelisted **or** they present a valid `AUTH_TOKEN`/person token.
+PersonAuth (inner) then, *only when `PERSON_AUTH_ENABLED=true`*, additionally
+rejects anyone without a valid person token. So:
+
+- **Populate `PERSON_TOKENS`, flag off:** teammates can migrate off the shared
+  `AUTH_TOKEN` to personal tokens and reach the service from any IP **now**,
+  while db-mcp (IP-whitelisted, in-cluster) keeps working untouched. This is the
+  safe migration window — do this first.
+- **Flip `PERSON_AUTH_ENABLED=true` (later):** identity is enforced for
+  everyone; `AUTH_TOKEN`-only callers start getting 401s; `AUTH_TOKEN` can then
+  be retired. Requires the db-mcp precondition below.
 
 ## Rollout
 1. Mint a token per teammate + one per service caller (staging EC2, CI):
@@ -23,6 +37,9 @@ Per-person bearer tokens replacing the shared AUTH_TOKEN for team callers.
    1. a service token has been minted for db-mcp (`python scripts/mint_person_token.py db-mcp-server`),
    2. that token's digest is added to the `PERSON_TOKENS` secret, and
    3. db-mcp-server's client is configured to send `Authorization: Bearer <service token>`.
+
+   Also note: `PERSON_AUTH_ENABLED=true` with an **empty** `PERSON_TOKENS` makes the
+   pod fail-fast (crashloop) by design — populate the secret first.
 
    Flip `PERSON_AUTH_ENABLED` to `"true"` in `eks/manifests/base/deployment-postgres-mcp.yaml`, apply, verify:
    - no token → 401; personal token → 200; old shared AUTH_TOKEN alone → still passes the IP-allowlist bypass but NOT PersonAuth (401) — expected: humans move to personal tokens now, AUTH_TOKEN fully retires in M4.

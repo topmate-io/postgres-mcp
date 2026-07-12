@@ -37,6 +37,7 @@ from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
 from .person_auth import PersonAuthMiddleware
+from .person_auth import PersonTokenRegistry
 from .person_auth import current_person
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
@@ -838,24 +839,37 @@ class RateLimiterMiddleware:
 class IPAllowlistMiddleware:
     """ASGI middleware that restricts access to allowed IPs/CIDRs.
 
-    Two ways to pass:
+    Three ways to pass:
       1. Client IP is in ``ALLOWED_IPS`` (CIDRs read from env).
-      2. Request carries a valid ``Authorization: Bearer <AUTH_TOKEN>`` — bypasses
-         the IP check for ops/backend callers from non-whitelisted hosts.
+      2. Request carries a valid ``Authorization: Bearer <AUTH_TOKEN>`` — the
+         shared static token (legacy, retired in M4).
+      3. Request carries a valid per-person token (LOOP-664): when a non-empty
+         ``PersonTokenRegistry`` is injected, any token it recognises grants the
+         same IP bypass. A person token is a stronger, revocable credential, so
+         — like ``AUTH_TOKEN`` — it lets a caller reach the service from a
+         non-whitelisted host. This is independent of ``PERSON_AUTH_ENABLED``,
+         which governs whether a person token is *required*, not whether it
+         grants network access.
 
     Health check paths are always exempt so ALB probes continue working.
-    If ``ALLOWED_IPS`` is empty AND ``AUTH_TOKEN`` is empty, all traffic is allowed
-    (backwards compatible).
+    If ``ALLOWED_IPS`` is empty, all traffic is allowed (backwards compatible);
+    the bearer bypasses only matter once an allowlist is configured.
     """
 
     HEALTH_PATHS = {"/", "/health", "/healthz"}
 
-    def __init__(self, app):
+    def __init__(self, app, registry: "PersonTokenRegistry | None" = None):
         self.app = app
         self.allowed_networks = self._load_allowed_ips()
         self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
+        self._person_registry = registry
         if self._auth_token:
             logger.info("IP allowlist: static Bearer token bypass enabled")
+        if self._person_registry is not None and len(self._person_registry) > 0:
+            logger.info(
+                "IP allowlist: person-token bypass enabled (%d token(s))",
+                len(self._person_registry),
+            )
 
     def _load_allowed_ips(self):
         raw = os.getenv("ALLOWED_IPS", "").strip()
@@ -913,16 +927,29 @@ class IPAllowlistMiddleware:
                 return path[len(prefix) :] or "/"
         return path
 
-    def _has_valid_bearer(self, scope) -> bool:
-        """Return True when the request carries a valid static Bearer token."""
-        if not self._auth_token:
-            return False
+    @staticmethod
+    def _extract_bearer(scope) -> str:
         headers = {name.lower(): value for name, value in scope.get("headers", [])}
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if not auth.startswith("Bearer "):
+            return ""
+        return auth[len("Bearer ") :].strip()
+
+    def _has_valid_bearer(self, scope) -> bool:
+        """Return True when the request carries a bearer that grants an IP bypass.
+
+        Accepts either the shared static ``AUTH_TOKEN`` or any token the injected
+        ``PersonTokenRegistry`` recognises. Both comparisons are constant-time
+        (``hmac.compare_digest`` directly, and inside ``registry.verify``).
+        """
+        presented = self._extract_bearer(scope)
+        if not presented:
             return False
-        presented = auth[len("Bearer ") :].strip()
-        return bool(presented) and hmac.compare_digest(presented, self._auth_token)
+        if self._auth_token and hmac.compare_digest(presented, self._auth_token):
+            return True
+        if self._person_registry is not None and self._person_registry.verify(presented) is not None:
+            return True
+        return False
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http" and self.allowed_networks is not None:
@@ -1265,14 +1292,21 @@ def build_middleware_stack(terminal_app):
     Middleware stack (outermost → innermost):
     0. RequestIDMiddleware — assigns correlation ID to every request
     1. CORSMiddleware — handles OPTIONS preflight + CORS headers
-    2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer (legacy, retired in M4)
+    2. IPAllowlistMiddleware — allows whitelisted IPs OR a valid AUTH_TOKEN /
+       person-token Bearer (LOOP-664; AUTH_TOKEN retired in M4)
     3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
     4. AuditLogMiddleware — one JSON audit line per request (LOOP-664 M1)
     5. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
     6. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
     7. HealthCheckMiddleware — ALB health probes
     8. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
+
+    The person-token registry is parsed ONCE here and shared by the IP allowlist
+    (person tokens grant IP bypass) and PersonAuth (person tokens are the identity
+    credential), so the two can never disagree on which tokens are valid. A
+    malformed ``PERSON_TOKENS`` fails loud at this point.
     """
+    registry = PersonTokenRegistry()
     return RequestIDMiddleware(
         CORSMiddleware(
             IPAllowlistMiddleware(
@@ -1287,8 +1321,10 @@ def build_middleware_stack(terminal_app):
                         ),
                         get_request_id=lambda: _request_id_var.get(""),
                     ),
+                    registry=registry,
                     get_request_id=lambda: _request_id_var.get(""),
-                )
+                ),
+                registry=registry,
             )
         )
     )
