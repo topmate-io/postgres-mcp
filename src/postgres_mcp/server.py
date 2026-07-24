@@ -135,6 +135,31 @@ def format_error_response(error: str) -> ResponseType:
     return format_text_response(f"Error: {_sanitize_error(error)}")
 
 
+async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> ResponseType | None:
+    """Return a proxied ResponseType for non-tm domains, or None to fall through to local.
+
+    Backward-compat: domain defaults to "tm" -> caller falls through to its existing
+    local path, unchanged byte-for-byte.
+
+    The two validation messages below are our own crafted, non-sensitive routing text
+    (not raw DB/exception text), so -- same reasoning as execute_sql's proxy path --
+    they're returned verbatim via format_text_response instead of format_error_response;
+    the latter runs _sanitize_error, which would collapse them down to a generic
+    "unexpected error occurred" string and destroy the informative domain list.
+    """
+    from . import domain_registry
+    from . import downstream_client
+
+    if domain == "tm":
+        return None
+    if not domain_registry.multi_domain_enabled():
+        return format_text_response("Error: multi-domain routing is disabled; only domain='tm' is available.")
+    if domain not in domain_registry.list_domains():
+        return format_text_response(f"Error: unknown domain '{domain}'. Valid: {', '.join(domain_registry.list_domains())}.")
+    client = await downstream_client.get_downstream_client(domain)
+    return format_text_response(await client.call_tool(tool_name, arguments))
+
+
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
 async def list_schemas() -> ResponseType:
     """List all schemas in the database."""
@@ -165,8 +190,12 @@ async def list_schemas() -> ResponseType:
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    domain: str = Field(description="Target database domain", default="tm"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
+    proxied = await _maybe_proxy(domain, "list_objects", {"schema_name": schema_name, "object_type": object_type})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
 
@@ -234,8 +263,12 @@ async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    domain: str = Field(description="Target database domain", default="tm"),
 ) -> ResponseType:
     """Get detailed information about a database object."""
+    proxied = await _maybe_proxy(domain, "get_object_details", {"schema_name": schema_name, "object_name": object_name, "object_type": object_type})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
 
