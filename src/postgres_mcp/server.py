@@ -156,8 +156,12 @@ async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> Response
         return format_text_response("Error: multi-domain routing is disabled; only domain='tm' is available.")
     if domain not in domain_registry.list_domains():
         return format_text_response(f"Error: unknown domain '{domain}'. Valid: {', '.join(domain_registry.list_domains())}.")
-    client = await downstream_client.get_downstream_client(domain)
-    return format_text_response(await client.call_tool(tool_name, arguments))
+    try:
+        client = await downstream_client.get_downstream_client(domain)
+        return format_text_response(await client.call_tool(tool_name, arguments))
+    except Exception as e:
+        logger.error(f"Error proxying {tool_name} to domain '{domain}': {e}")
+        return format_text_response(f"Error: downstream '{domain}' unavailable ({type(e).__name__})")
 
 
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))

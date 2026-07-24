@@ -46,3 +46,20 @@ async def test_unknown_domain_lists_valid():
     txt = _text(resp)
     assert "bogus" in txt
     assert "tm" in txt
+
+
+@pytest.mark.asyncio
+async def test_list_objects_downstream_error_bounded(monkeypatch):
+    class _Client:
+        async def call_tool(self, name, arguments=None):
+            raise ConnectionError("All connection attempts failed")
+
+    async def _get_client(domain):
+        return _Client()
+
+    monkeypatch.setattr(downstream_client, "get_downstream_client", _get_client)
+    resp = await server.list_objects(schema_name="public", object_type="table", domain="igdm")
+    txt = _text(resp)
+    assert "igdm" in txt
+    assert "ConnectionError" in txt
+    assert "All connection attempts failed" not in txt  # raw text not leaked
