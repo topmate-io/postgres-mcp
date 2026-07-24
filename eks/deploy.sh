@@ -191,11 +191,25 @@ if [ "$SKIP_SECRETS" = false ]; then
     PERSON_TOKENS_JSON=""
   }
 
+  # LOOP-664 M3: shared bearer token postgres-mcp presents to sibling per-DB MCPs
+  # (instagram-mcp, v2-ledger/payment/payout) when MULTI_DOMAIN_ENABLED=true.
+  # Its digest must also be registered in each downstream's person-tokens, same
+  # mechanism M1 used for svc-db-mcp.
+  SVC_INTERNAL_MCP_TOKEN=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/svc-internal-mcp-token \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "  WARN: topmate/postgres-mcp/svc-internal-mcp-token not found — multi-domain routing (LOOP-664 M3) cannot be enabled."
+    echo "        Create it with: aws secretsmanager create-secret --name topmate/postgres-mcp/svc-internal-mcp-token \\"
+    echo "          --secret-string '<random-token>'   (register the sha256 digest in each downstream's person-tokens as svc-internal-mcp)"
+    SVC_INTERNAL_MCP_TOKEN=""
+  }
+
   kubectl create secret generic postgres-mcp-secrets \
     --from-literal=database-uri="${DATABASE_URI}" \
     --from-literal=logic-hub-url="${LOGIC_HUB_URL}" \
     --from-literal=logic-hub-api-key="${LOGIC_HUB_API_KEY}" \
     --from-literal=person-tokens="${PERSON_TOKENS_JSON}" \
+    --from-literal=svc-internal-mcp-token="${SVC_INTERNAL_MCP_TOKEN}" \
     -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 

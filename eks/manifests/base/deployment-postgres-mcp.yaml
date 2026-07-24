@@ -131,6 +131,27 @@ spec:
                   name: topmate-bi-secrets
                   key: identity-jwt-public-key
                   optional: true
+            # LOOP-664 M3: multi-DB router (proxy to sibling per-DB MCPs).
+            # Flip to "true" only after DOMAIN_REGISTRY_JSON entries are verified
+            # reachable (see docs) and svc-internal-mcp-token is minted/distributed.
+            - name: MULTI_DOMAIN_ENABLED
+              value: "false"
+            # Service DNS is intra-namespace (postgres-mcp), so short names resolve.
+            # All Services below expose port 80 -> targetPort 8000 (no :8000 suffix
+            # needed on base_url); downstream client appends /sse or /mcp itself.
+            # NOTE(rollout): instagram-mcp-service is deployed separately (not in
+            # this manifest set) — verify it exposes port 80 like the others
+            # (`kubectl -n postgres-mcp get svc instagram-mcp-service`) before
+            # flipping MULTI_DOMAIN_ENABLED to "true".
+            - name: DOMAIN_REGISTRY_JSON
+              value: >-
+                {"igdm":{"base_url":"http://instagram-mcp-service","token_env":"SVC_INTERNAL_MCP_TOKEN","database":"instagram_auto_dm"},"fin_ledger":{"base_url":"http://postgres-mcp-v2-ledger-service","token_env":"SVC_INTERNAL_MCP_TOKEN","database":"ledger_db"},"fin_payment":{"base_url":"http://postgres-mcp-v2-payment-service","token_env":"SVC_INTERNAL_MCP_TOKEN","database":"payment_db"},"fin_payout":{"base_url":"http://postgres-mcp-v2-payout-service","token_env":"SVC_INTERNAL_MCP_TOKEN","database":"payout_db"}}
+            - name: SVC_INTERNAL_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-mcp-secrets
+                  key: svc-internal-mcp-token
+                  optional: true
           resources:
             requests:
               memory: "512Mi"
