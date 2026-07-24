@@ -627,6 +627,20 @@ async def get_topmate_schema_guide() -> ResponseType:
 
 
 @mcp.tool(
+    name="get_schema_guide",
+    description="Returns the per-domain routing table + schema/business-logic guide for the unified "
+    "multi-DB MCP. Call this FIRST to choose the right `domain` for execute_sql.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+async def get_schema_guide() -> ResponseType:
+    from . import domain_registry
+    from .domain_guide import build_schema_guide
+
+    enabled = domain_registry.list_domains() if domain_registry.multi_domain_enabled() else ["tm"]
+    return format_text_response(build_schema_guide(enabled))
+
+
+@mcp.tool(
     name="get_topmate_troubleshooting_guide",
     description="Provides troubleshooting guidance for common SQL issues when querying Topmate database. "
     "Covers slow queries, incorrect results, complex aggregations, booking queries, and user metrics.",
