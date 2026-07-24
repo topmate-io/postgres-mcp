@@ -31,6 +31,8 @@ def is_read_only_sql(sql: str) -> bool:
     first = lowered.split(None, 1)[0] if lowered.split(None, 1) else ""
     if first not in _ALLOWED_FIRST:
         return False
-    if first == "explain" and "analyze" in lowered:
+    if first == "explain" and re.search(r"\banalyze\b", lowered):
+        return False
+    if first == "with" and re.search(r"\b(insert|update|delete|merge)\b", lowered):
         return False
     return True
