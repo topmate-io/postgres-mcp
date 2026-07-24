@@ -94,5 +94,6 @@ async def test_proxy_downstream_error_preserves_domain(monkeypatch):
     monkeypatch.setattr(downstream_client, "get_downstream_client", _get_client)
     resp = await server.execute_sql("select 1", domain="igdm")
     txt = _text(resp)
-    assert "igdm" in txt
-    assert "connection" in txt.lower()
+    assert "igdm" in txt  # domain preserved
+    assert "ConnectionError" in txt  # failure class preserved
+    assert "All connection attempts failed" not in txt  # raw exception text NOT leaked
