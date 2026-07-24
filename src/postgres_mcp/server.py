@@ -493,7 +493,7 @@ async def execute_sql(
         return format_text_response(raw)
     except Exception as e:
         logger.error(f"Error proxying execute_sql to domain '{domain}': {e}")
-        return format_error_response(f"downstream '{domain}' error: {e}")
+        return format_text_response(f"Error: downstream '{domain}' unavailable: {e}")
 
 
 @mcp.tool(

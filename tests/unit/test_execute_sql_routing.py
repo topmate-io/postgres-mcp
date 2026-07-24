@@ -80,3 +80,19 @@ async def test_proxy_non_select_rejected():
 async def test_unknown_domain_lists_valid():
     resp = await server.execute_sql("select 1", domain="bogus")
     assert "bogus" in _text(resp) and "tm" in _text(resp)
+
+
+@pytest.mark.asyncio
+async def test_proxy_downstream_error_preserves_domain(monkeypatch):
+    class _Client:
+        async def call_tool(self, name, arguments=None):
+            raise ConnectionError("All connection attempts failed")
+
+    async def _get_client(domain):
+        return _Client()
+
+    monkeypatch.setattr(downstream_client, "get_downstream_client", _get_client)
+    resp = await server.execute_sql("select 1", domain="igdm")
+    txt = _text(resp)
+    assert "igdm" in txt
+    assert "connection" in txt.lower()
