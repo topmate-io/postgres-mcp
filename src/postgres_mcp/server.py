@@ -444,20 +444,56 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
-# Query function declaration without the decorator - we'll add it dynamically based on access mode
+# Query function declaration without the decorator - we'll add it dynamically based on access mode.
+# @validate_call (same decorator analyze_query_indexes/analyze_workload_indexes already use with
+# mcp.add_tool/@mcp.tool) makes pydantic resolve the Field(...) defaults on a direct in-process call
+# (e.g. server.execute_sql("select 1")) -- without it, `domain` would be a bare FieldInfo object,
+# not the string "tm", when the function isn't invoked through the MCP framework's own binding.
+@validate_call
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
+    domain: str = Field(
+        description="Which database to query: 'tm' (Topmate core, default), 'igdm', "
+        "'fin_ledger', 'fin_payment', 'fin_payout'. Call get_schema_guide first.",
+        default="tm",
+    ),
 ) -> ResponseType:
-    """Executes a SQL query against the database."""
+    """Executes a read-only SQL query against the selected domain's database."""
+    from . import domain_registry
+    from . import downstream_client
+    from .readonly_guard import is_read_only_sql
+
+    # Backward-compat: domain defaults to "tm" -> existing local path, unchanged byte-for-byte.
+    if domain == "tm":
+        try:
+            sql_driver = await get_sql_driver()
+            rows = await sql_driver.execute_query(sql)  # type: ignore
+            if rows is None:
+                return format_text_response("No results")
+            return format_text_response(list([r.cells for r in rows]))
+        except Exception as e:
+            logger.error(f"Error executing query: {e}")
+            return format_error_response(str(e))
+
+    # Proxy path (non-tm domain). Gated end-to-end by MULTI_DOMAIN_ENABLED; these are our own
+    # crafted, non-sensitive validation messages (not raw DB/exception text), so we return them
+    # verbatim via format_text_response instead of format_error_response -- the latter runs
+    # _sanitize_error, which is designed to scrub internal DB/exception details and would otherwise
+    # collapse these routing messages down to a generic "unexpected error occurred" string.
+    if not domain_registry.multi_domain_enabled():
+        return format_text_response("Error: multi-domain routing is disabled (MULTI_DOMAIN_ENABLED=false); only domain='tm' is available.")
+    if domain not in domain_registry.list_domains():
+        return format_text_response(f"Error: unknown domain '{domain}'. Valid domains: {', '.join(domain_registry.list_domains())}.")
+    if not is_read_only_sql(sql):
+        return format_text_response("Error: only read-only (SELECT/WITH/EXPLAIN/SHOW) statements are allowed.")
     try:
-        sql_driver = await get_sql_driver()
-        rows = await sql_driver.execute_query(sql)  # type: ignore
-        if rows is None:
-            return format_text_response("No results")
-        return format_text_response(list([r.cells for r in rows]))
+        client = await downstream_client.get_downstream_client(domain)
+        raw = await client.call_tool("execute_sql", {"sql": sql})
+        # raw is already the downstream's formatted text -- pass through verbatim, no re-narration.
+        return format_text_response(raw)
     except Exception as e:
-        logger.error(f"Error executing query: {e}")
-        return format_error_response(str(e))
+        logger.error(f"Error proxying execute_sql to domain '{domain}': {e}")
+        return format_error_response(f"downstream '{domain}' error: {e}")
 
 
 @mcp.tool(
