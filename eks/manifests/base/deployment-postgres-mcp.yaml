@@ -89,12 +89,11 @@ spec:
                   name: topmate-bi-secrets
                   key: auth-token
                   optional: true
-            # LOOP-664 M1: per-person auth. LIVE since 2026-07-12 — tokens are
-            # minted/distributed (see docs/PERSON_AUTH.md). This is the ONLY access
-            # gate in front of the M3 multi-domain router, so it MUST stay "true":
-            # disabling it would expose proxied fin_*/igdm data to unauthenticated
-            # callers. (Base manifest previously drifted to "false" while live ran
-            # "true"; corrected 2026-07-25 so a full deploy.sh apply can't regress it.)
+            # LOOP-664 M1: per-person auth. LIVE in prod. This is the access gate in
+            # front of the M3 multi-domain router, so it MUST stay "true" (disabling
+            # it removes the gate). The base manifest previously drifted to "false"
+            # while prod ran "true"; corrected 2026-07-25 so a full deploy.sh apply
+            # cannot regress it. See the internal design spec for rationale.
             - name: PERSON_AUTH_ENABLED
               value: "true"
             - name: PERSON_TOKENS
@@ -135,16 +134,11 @@ spec:
                   name: topmate-bi-secrets
                   key: identity-jwt-public-key
                   optional: true
-            # LOOP-664 M3: multi-DB router (proxy to sibling per-DB MCPs).
-            # Verified 2026-07-25 from inside the router pod: all four downstreams
-            # answer execute_sql over /mcp with HTTP 200 and NO bearer token — the
-            # cluster pod CIDR is already inside each downstream's IP allowlist, so
-            # intra-namespace pod->pod calls are admitted without a service token.
-            # The real access gate is postgres-mcp's own inbound person-auth
-            # (PERSON_AUTH_ENABLED=true), which every proxied call passes first.
-            # Transport is streamable_http (stateless /mcp) — deliberately NOT SSE —
-            # to avoid the persistent-stream reliability class entirely for internal
-            # proxying. No svc-internal-mcp-token is needed or configured.
+            # LOOP-664 M3: multi-DB router — proxies to the sibling per-DB MCPs over
+            # intra-cluster /mcp. Transport is streamable_http (stateless), not SSE.
+            # The router presents no separate service token to downstreams; inbound
+            # person-auth (PERSON_AUTH_ENABLED, above) is the access gate. The
+            # downstream trust-boundary rationale lives in the internal design spec.
             - name: MULTI_DOMAIN_ENABLED
               value: "true"
             # Service DNS is intra-namespace (postgres-mcp), so short names resolve.

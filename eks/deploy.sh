@@ -192,11 +192,10 @@ if [ "$SKIP_SECRETS" = false ]; then
   }
 
   # LOOP-664 M3: multi-domain routing (MULTI_DOMAIN_ENABLED=true) proxies to the
-  # sibling per-DB MCPs (instagram-mcp, v2-ledger/payment/payout). Verified
-  # 2026-07-25 that those downstreams admit intra-cluster pod->pod /mcp calls with
-  # NO bearer token (the pod CIDR is inside their IP allowlist), so no service
-  # token is minted or presented — the inbound person-auth perimeter on this
-  # service is the real access gate. See eks/manifests/base/deployment-postgres-mcp.yaml.
+  # sibling per-DB MCPs (instagram-mcp, v2-ledger/payment/payout) over intra-cluster
+  # /mcp. The router presents no separate service token; the inbound person-auth
+  # perimeter on this service is the access gate. See the internal design spec for
+  # the downstream trust-boundary rationale.
 
   kubectl create secret generic postgres-mcp-secrets \
     --from-literal=database-uri="${DATABASE_URI}" \
