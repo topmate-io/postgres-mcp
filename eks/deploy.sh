@@ -182,10 +182,26 @@ if [ "$SKIP_SECRETS" = false ]; then
     exit 1
   }
 
+  PERSON_TOKENS_JSON=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/person-tokens \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "  WARN: topmate/postgres-mcp/person-tokens not found — PersonAuth (LOOP-664 M1) cannot be enabled."
+    echo "        Create it with: aws secretsmanager create-secret --name topmate/postgres-mcp/person-tokens \\"
+    echo "          --secret-string '{\"<name>\": \"<sha256-hex>\"}'   (mint entries via scripts/mint_person_token.py)"
+    PERSON_TOKENS_JSON=""
+  }
+
+  # LOOP-664 M3: multi-domain routing (MULTI_DOMAIN_ENABLED=true) proxies to the
+  # sibling per-DB MCPs (instagram-mcp, v2-ledger/payment/payout) over intra-cluster
+  # /mcp. The router presents no separate service token; the inbound person-auth
+  # perimeter on this service is the access gate. See the internal design spec for
+  # the downstream trust-boundary rationale.
+
   kubectl create secret generic postgres-mcp-secrets \
     --from-literal=database-uri="${DATABASE_URI}" \
     --from-literal=logic-hub-url="${LOGIC_HUB_URL}" \
     --from-literal=logic-hub-api-key="${LOGIC_HUB_API_KEY}" \
+    --from-literal=person-tokens="${PERSON_TOKENS_JSON}" \
     -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
