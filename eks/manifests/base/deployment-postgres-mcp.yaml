@@ -89,10 +89,14 @@ spec:
                   name: topmate-bi-secrets
                   key: auth-token
                   optional: true
-            # LOOP-664 M1: per-person auth. Flip to "true" only after tokens
-            # are minted and distributed (see docs/PERSON_AUTH.md).
+            # LOOP-664 M1: per-person auth. LIVE since 2026-07-12 — tokens are
+            # minted/distributed (see docs/PERSON_AUTH.md). This is the ONLY access
+            # gate in front of the M3 multi-domain router, so it MUST stay "true":
+            # disabling it would expose proxied fin_*/igdm data to unauthenticated
+            # callers. (Base manifest previously drifted to "false" while live ran
+            # "true"; corrected 2026-07-25 so a full deploy.sh apply can't regress it.)
             - name: PERSON_AUTH_ENABLED
-              value: "false"
+              value: "true"
             - name: PERSON_TOKENS
               valueFrom:
                 secretKeyRef:
