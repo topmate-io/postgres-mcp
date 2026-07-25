@@ -135,33 +135,55 @@ def format_error_response(error: str) -> ResponseType:
     return format_text_response(f"Error: {_sanitize_error(error)}")
 
 
-async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> ResponseType | None:
-    """Return a proxied ResponseType for non-tm domains, or None to fall through to local.
+def _domain_validation_error(domain: str) -> ResponseType | None:
+    """Validate a proxy domain. Return an error ResponseType to short-circuit, or None if
+    routing is enabled and the domain is known.
 
-    Backward-compat: domain defaults to "tm" -> caller falls through to its existing
-    local path, unchanged byte-for-byte.
-
-    The two validation messages below are our own crafted, non-sensitive routing text
-    (not raw DB/exception text), so -- same reasoning as execute_sql's proxy path --
-    they're returned verbatim via format_text_response instead of format_error_response;
-    the latter runs _sanitize_error, which would collapse them down to a generic
-    "unexpected error occurred" string and destroy the informative domain list.
+    These messages are our own crafted, non-sensitive routing text (not raw DB/exception
+    text), so they're returned verbatim via format_text_response rather than
+    format_error_response; the latter runs _sanitize_error, which would collapse them down
+    to a generic "unexpected error occurred" string and destroy the informative domain list.
     """
     from . import domain_registry
+
+    if not domain_registry.multi_domain_enabled():
+        return format_text_response("Error: multi-domain routing is disabled (MULTI_DOMAIN_ENABLED=false); only domain='tm' is available.")
+    if domain not in domain_registry.list_domains():
+        return format_text_response(f"Error: unknown domain '{domain}'. Valid domains: {', '.join(domain_registry.list_domains())}.")
+    return None
+
+
+async def _call_downstream(domain: str, tool_name: str, arguments: dict) -> ResponseType:
+    """Proxy a tool call to a downstream domain MCP with bounded, non-leaking error handling.
+
+    On failure the returned text preserves only the domain and the exception class name
+    (e.g. 'ConnectionError') -- never the raw exception text, which can carry internal
+    host/network detail. Full detail is logged server-side only. This single choke point
+    is why the security fix (bound the error text) can no longer be applied to one proxy
+    path and missed on the other.
+    """
     from . import downstream_client
 
-    if domain == "tm":
-        return None
-    if not domain_registry.multi_domain_enabled():
-        return format_text_response("Error: multi-domain routing is disabled; only domain='tm' is available.")
-    if domain not in domain_registry.list_domains():
-        return format_text_response(f"Error: unknown domain '{domain}'. Valid: {', '.join(domain_registry.list_domains())}.")
     try:
         client = await downstream_client.get_downstream_client(domain)
         return format_text_response(await client.call_tool(tool_name, arguments))
     except Exception as e:
         logger.error(f"Error proxying {tool_name} to domain '{domain}': {e}")
         return format_text_response(f"Error: downstream '{domain}' unavailable ({type(e).__name__})")
+
+
+async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> ResponseType | None:
+    """Return a proxied ResponseType for non-tm domains, or None to fall through to local.
+
+    Backward-compat: domain defaults to "tm" -> caller falls through to its existing
+    local path, unchanged byte-for-byte.
+    """
+    if domain == "tm":
+        return None
+    err = _domain_validation_error(domain)
+    if err is not None:
+        return err
+    return await _call_downstream(domain, tool_name, arguments)
 
 
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
@@ -496,8 +518,6 @@ async def execute_sql(
     ),
 ) -> ResponseType:
     """Executes a read-only SQL query against the selected domain's database."""
-    from . import domain_registry
-    from . import downstream_client
     from .readonly_guard import is_read_only_sql
 
     # Backward-compat: domain defaults to "tm" -> existing local path, unchanged byte-for-byte.
@@ -512,25 +532,16 @@ async def execute_sql(
             logger.error(f"Error executing query: {e}")
             return format_error_response(str(e))
 
-    # Proxy path (non-tm domain). Gated end-to-end by MULTI_DOMAIN_ENABLED; these are our own
-    # crafted, non-sensitive validation messages (not raw DB/exception text), so we return them
-    # verbatim via format_text_response instead of format_error_response -- the latter runs
-    # _sanitize_error, which is designed to scrub internal DB/exception details and would otherwise
-    # collapse these routing messages down to a generic "unexpected error occurred" string.
-    if not domain_registry.multi_domain_enabled():
-        return format_text_response("Error: multi-domain routing is disabled (MULTI_DOMAIN_ENABLED=false); only domain='tm' is available.")
-    if domain not in domain_registry.list_domains():
-        return format_text_response(f"Error: unknown domain '{domain}'. Valid domains: {', '.join(domain_registry.list_domains())}.")
+    # Proxy path (non-tm domain). Domain validation + bounded downstream error handling are
+    # shared with the discovery tools via _domain_validation_error / _call_downstream so the
+    # security-sensitive error bounding lives in exactly one place.
+    err = _domain_validation_error(domain)
+    if err is not None:
+        return err
     if not is_read_only_sql(sql):
         return format_text_response("Error: only read-only (SELECT/WITH/EXPLAIN/SHOW) statements are allowed.")
-    try:
-        client = await downstream_client.get_downstream_client(domain)
-        raw = await client.call_tool("execute_sql", {"sql": sql})
-        # raw is already the downstream's formatted text -- pass through verbatim, no re-narration.
-        return format_text_response(raw)
-    except Exception as e:
-        logger.error(f"Error proxying execute_sql to domain '{domain}': {e}")
-        return format_text_response(f"Error: downstream '{domain}' unavailable ({type(e).__name__})")
+    # raw is already the downstream's formatted text -- pass through verbatim, no re-narration.
+    return await _call_downstream(domain, "execute_sql", {"sql": sql})
 
 
 @mcp.tool(
@@ -1620,6 +1631,16 @@ async def shutdown(sig=None):
         logger.info("Closed database connections")
     except Exception as e:
         logger.error(f"Error closing database connections: {e}")
+
+    # Close any downstream proxy MCP clients (multi-domain router). No-op when
+    # multi-domain routing was never enabled (the client cache stays empty).
+    try:
+        from . import downstream_client
+
+        await downstream_client.close_all_clients()
+        logger.info("Closed downstream MCP clients")
+    except Exception as e:
+        logger.error(f"Error closing downstream MCP clients: {e}")
 
     # Exit with appropriate status code
     sys.exit(128 + sig.value if sig is not None else 0)

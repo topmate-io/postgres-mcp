@@ -73,6 +73,7 @@ Config (env/JSON), one entry per domain: `domain -> { downstream base URL, servi
 
 - **Inbound:** reuse the M1 `PersonAuthMiddleware` (team-only person tokens) already live on `postgres-mcp`.
 - **Outbound:** `postgres-mcp` presents a **service token** to each downstream (all downstreams adopted the M1 image and require a token). Mint `svc-internal-mcp` tokens, register their digests in each downstream's `person-tokens`, store the raw token in `postgres-mcp-secrets`. Mirrors the existing `svc-db-mcp` / `db-mcp-postgres-token` pattern.
+- **Accepted tradeoff — audit attribution loss on proxied domains:** the outbound service token is *shared* (one `svc-internal-mcp` identity for all router→downstream calls). The person identity of the original caller is authenticated at `postgres-mcp`'s inbound perimeter and logged there, but it is **not** forwarded to the downstream. So a downstream MCP's audit trail attributes every proxied `igdm`/`fin_*` query to the single `svc-internal-mcp` principal, not to the human who issued it. This is a conscious v1 tradeoff: the authoritative per-caller record lives in `postgres-mcp`'s logs (inbound), and this is a read-only internal tool. If per-caller attribution is later required *inside* a downstream (e.g. for a finance-domain audit), the router must forward caller identity (e.g. an `X-On-Behalf-Of` header the downstream trusts) — out of scope for M3. Revisit before exposing `fin_*` beyond the internal team.
 
 ## 5. Backward-compatibility (the key risk of D3)
 

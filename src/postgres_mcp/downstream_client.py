@@ -205,7 +205,7 @@ class DownstreamMCPClient:
         self._lifecycle_task = None
 
 
-# --- appended to src/postgres_mcp/downstream_client.py ---
+# --- Module-level client cache: one DownstreamMCPClient per proxy domain ---
 
 _clients: dict[str, DownstreamMCPClient] = {}
 _clients_lock = asyncio.Lock()

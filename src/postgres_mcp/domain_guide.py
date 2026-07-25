@@ -88,4 +88,7 @@ CROSS_DOMAIN_NOTE = (
 def build_schema_guide(enabled_domains: list[str]) -> dict:
     domains = {d: MULTI_DOMAIN_GUIDE[d] for d in enabled_domains if d in MULTI_DOMAIN_GUIDE}
     routing = {d: ROUTING_TABLE[d] for d in enabled_domains if d in ROUTING_TABLE}
-    return {"routing": routing, "cross_domain": CROSS_DOMAIN_NOTE, "domains": domains}
+    # The cross-domain "no SQL joins across RDS instances" caveat only makes sense when more
+    # than one domain is reachable; when only tm is enabled it's noise, so drop it.
+    cross_domain = CROSS_DOMAIN_NOTE if len(enabled_domains) > 1 else ""
+    return {"routing": routing, "cross_domain": cross_domain, "domains": domains}
