@@ -9,6 +9,7 @@ import os
 import signal
 import sys
 import uuid
+from collections import OrderedDict
 from enum import Enum
 from typing import Any
 from typing import List
@@ -23,24 +24,30 @@ from pydantic import validate_call
 
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
+from . import caller_identity
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
+from .asgi_utils import get_client_ip
+from .asgi_utils import get_path
+from .audit import AuditLogMiddleware
 from .database_health import DatabaseHealthTool
 from .database_health import HealthType
 from .explain import ExplainPlanTool
 from .index.index_opt_base import MAX_NUM_INDEX_TUNING_QUERIES
 from .index.llm_opt import LLMOptimizerTool
 from .index.presentation import TextPresentation
+from .person_auth import PersonAuthMiddleware
+from .person_auth import PersonTokenRegistry
+from .person_auth import current_person
 from .sql import DbConnPool
 from .sql import SafeSqlDriver
 from .sql import SqlDriver
 from .sql import check_hypopg_installation_status
 from .sql import obfuscate_password
 from .top_queries import TopQueriesCalc
-from .topmate_business_logic import TopmateBuisnessLogic
 from .topmate_business_logic import TOPMATE_SCHEMA_GUIDE
 from .topmate_business_logic import TROUBLESHOOTING_GUIDE
-from . import caller_identity
+from .topmate_business_logic import TopmateBuisnessLogic
 
 # S1: stateless_http makes the Streamable-HTTP (/mcp) session manager stateless
 # so postgres-mcp can run multiple replicas behind the non-sticky in-cluster
@@ -111,8 +118,10 @@ def _sanitize_error(error: str) -> str:
         return "Permission denied for this operation."
     if "duplicate" in e_lower:
         return "Duplicate entry — this record already exists."
-    if any(k in e_lower for k in ("connection refused", "could not connect", "connection reset",
-                                   "name resolution", "network unreachable", "timeout expired")):
+    if any(
+        k in e_lower
+        for k in ("connection refused", "could not connect", "connection reset", "name resolution", "network unreachable", "timeout expired")
+    ):
         return "Database temporarily unavailable. Please try again in a moment."
     if "timeout" in e_lower or "cancel" in e_lower:
         return "Query took too long. Try a more specific query with filters or a LIMIT clause."
@@ -124,6 +133,57 @@ def _sanitize_error(error: str) -> str:
 def format_error_response(error: str) -> ResponseType:
     """Format a user-friendly error response (sanitized)."""
     return format_text_response(f"Error: {_sanitize_error(error)}")
+
+
+def _domain_validation_error(domain: str) -> ResponseType | None:
+    """Validate a proxy domain. Return an error ResponseType to short-circuit, or None if
+    routing is enabled and the domain is known.
+
+    These messages are our own crafted, non-sensitive routing text (not raw DB/exception
+    text), so they're returned verbatim via format_text_response rather than
+    format_error_response; the latter runs _sanitize_error, which would collapse them down
+    to a generic "unexpected error occurred" string and destroy the informative domain list.
+    """
+    from . import domain_registry
+
+    if not domain_registry.multi_domain_enabled():
+        return format_text_response("Error: multi-domain routing is disabled (MULTI_DOMAIN_ENABLED=false); only domain='tm' is available.")
+    if domain not in domain_registry.list_domains():
+        return format_text_response(f"Error: unknown domain '{domain}'. Valid domains: {', '.join(domain_registry.list_domains())}.")
+    return None
+
+
+async def _call_downstream(domain: str, tool_name: str, arguments: dict) -> ResponseType:
+    """Proxy a tool call to a downstream domain MCP with bounded, non-leaking error handling.
+
+    On failure the returned text preserves only the domain and the exception class name
+    (e.g. 'ConnectionError') -- never the raw exception text, which can carry internal
+    host/network detail. Full detail is logged server-side only. This single choke point
+    is why the security fix (bound the error text) can no longer be applied to one proxy
+    path and missed on the other.
+    """
+    from . import downstream_client
+
+    try:
+        client = await downstream_client.get_downstream_client(domain)
+        return format_text_response(await client.call_tool(tool_name, arguments))
+    except Exception as e:
+        logger.error(f"Error proxying {tool_name} to domain '{domain}': {e}")
+        return format_text_response(f"Error: downstream '{domain}' unavailable ({type(e).__name__})")
+
+
+async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> ResponseType | None:
+    """Return a proxied ResponseType for non-tm domains, or None to fall through to local.
+
+    Backward-compat: domain defaults to "tm" -> caller falls through to its existing
+    local path, unchanged byte-for-byte.
+    """
+    if domain == "tm":
+        return None
+    err = _domain_validation_error(domain)
+    if err is not None:
+        return err
+    return await _call_downstream(domain, tool_name, arguments)
 
 
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
@@ -156,8 +216,12 @@ async def list_schemas() -> ResponseType:
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    domain: str = Field(description="Target database domain", default="tm"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
+    proxied = await _maybe_proxy(domain, "list_objects", {"schema_name": schema_name, "object_type": object_type})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
 
@@ -225,8 +289,12 @@ async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
+    domain: str = Field(description="Target database domain", default="tm"),
 ) -> ResponseType:
     """Get detailed information about a database object."""
+    proxied = await _maybe_proxy(domain, "get_object_details", {"schema_name": schema_name, "object_name": object_name, "object_type": object_type})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
 
@@ -353,7 +421,10 @@ async def get_object_details(
         return format_error_response(str(e))
 
 
-@mcp.tool(description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.", annotations=types.ToolAnnotations(readOnlyHint=True))
+@mcp.tool(
+    description="Explains the execution plan for a SQL query, showing how the database will execute it and provides detailed cost estimates.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
 async def explain_query(
     sql: str = Field(description="SQL query to explain"),
     analyze: bool = Field(
@@ -432,23 +503,51 @@ If there is no hypothetical index, you can pass an empty list.""",
         return format_error_response(str(e))
 
 
-# Query function declaration without the decorator - we'll add it dynamically based on access mode
+# Query function declaration without the decorator - we'll add it dynamically based on access mode.
+# @validate_call (same decorator analyze_query_indexes/analyze_workload_indexes already use with
+# mcp.add_tool/@mcp.tool) makes pydantic resolve the Field(...) defaults on a direct in-process call
+# (e.g. server.execute_sql("select 1")) -- without it, `domain` would be a bare FieldInfo object,
+# not the string "tm", when the function isn't invoked through the MCP framework's own binding.
+@validate_call
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
+    domain: str = Field(
+        description="Which database to query: 'tm' (Topmate core, default), 'igdm', "
+        "'fin_ledger', 'fin_payment', 'fin_payout'. Call get_schema_guide first.",
+        default="tm",
+    ),
 ) -> ResponseType:
-    """Executes a SQL query against the database."""
-    try:
-        sql_driver = await get_sql_driver()
-        rows = await sql_driver.execute_query(sql)  # type: ignore
-        if rows is None:
-            return format_text_response("No results")
-        return format_text_response(list([r.cells for r in rows]))
-    except Exception as e:
-        logger.error(f"Error executing query: {e}")
-        return format_error_response(str(e))
+    """Executes a read-only SQL query against the selected domain's database."""
+    from .readonly_guard import is_read_only_sql
+
+    # Backward-compat: domain defaults to "tm" -> existing local path, unchanged byte-for-byte.
+    if domain == "tm":
+        try:
+            sql_driver = await get_sql_driver()
+            rows = await sql_driver.execute_query(sql)  # type: ignore
+            if rows is None:
+                return format_text_response("No results")
+            return format_text_response(list([r.cells for r in rows]))
+        except Exception as e:
+            logger.error(f"Error executing query: {e}")
+            return format_error_response(str(e))
+
+    # Proxy path (non-tm domain). Domain validation + bounded downstream error handling are
+    # shared with the discovery tools via _domain_validation_error / _call_downstream so the
+    # security-sensitive error bounding lives in exactly one place.
+    err = _domain_validation_error(domain)
+    if err is not None:
+        return err
+    if not is_read_only_sql(sql):
+        return format_text_response("Error: only read-only (SELECT/WITH/EXPLAIN/SHOW) statements are allowed.")
+    # raw is already the downstream's formatted text -- pass through verbatim, no re-narration.
+    return await _call_downstream(domain, "execute_sql", {"sql": sql})
 
 
-@mcp.tool(description="Analyze frequently executed queries in the database and recommend optimal indexes", annotations=types.ToolAnnotations(readOnlyHint=True))
+@mcp.tool(
+    description="Analyze frequently executed queries in the database and recommend optimal indexes",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
 @validate_call
 async def analyze_workload_indexes(
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
@@ -576,6 +675,20 @@ async def get_topmate_schema_guide() -> ResponseType:
 
 
 @mcp.tool(
+    name="get_schema_guide",
+    description="Returns the per-domain routing table + schema/business-logic guide for the unified "
+    "multi-DB MCP. Call this FIRST to choose the right `domain` for execute_sql.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+async def get_schema_guide() -> ResponseType:
+    from . import domain_registry
+    from .domain_guide import build_schema_guide
+
+    enabled = domain_registry.list_domains() if domain_registry.multi_domain_enabled() else ["tm"]
+    return format_text_response(build_schema_guide(enabled))
+
+
+@mcp.tool(
     name="get_topmate_troubleshooting_guide",
     description="Provides troubleshooting guidance for common SQL issues when querying Topmate database. "
     "Covers slow queries, incorrect results, complex aggregations, booking queries, and user metrics.",
@@ -673,6 +786,7 @@ class RequestIDMiddleware:
 
         token = _request_id_var.set(req_id)
         try:
+
             async def send_with_request_id(message):
                 if message["type"] == "http.response.start":
                     extra = [[b"x-request-id", req_id.encode()]]
@@ -713,16 +827,18 @@ class CORSMiddleware:
 
         # Preflight
         if method == "OPTIONS":
-            await send({
-                "type": "http.response.start",
-                "status": 204,
-                "headers": [
-                    [b"access-control-allow-origin", origin.encode()],
-                    [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
-                    [b"access-control-allow-headers", b"Authorization, Content-Type"],
-                    [b"access-control-max-age", b"86400"],
-                ],
-            })
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 204,
+                    "headers": [
+                        [b"access-control-allow-origin", origin.encode()],
+                        [b"access-control-allow-methods", b"GET, POST, OPTIONS"],
+                        [b"access-control-allow-headers", b"Authorization, Content-Type"],
+                        [b"access-control-max-age", b"86400"],
+                    ],
+                }
+            )
             await send({"type": "http.response.body", "body": b""})
             return
 
@@ -739,46 +855,45 @@ class CORSMiddleware:
 
 
 class RateLimiterMiddleware:
-    """Per-IP token-bucket rate limiter for postgres-mcp.
+    """Token-bucket rate limiter keyed on authenticated identity (LOOP-664 M1).
 
-    Exempt paths: health checks.
-    If a client exceeds the rate, returns 429 with Retry-After header.
+    Bucket key: ``person:<name>`` when PersonAuth resolved a caller, else
+    ``ip:<client-ip>``. Identity comes ONLY from the current_person contextvar
+    (set post-authentication) — never from request headers, which callers
+    control. The bucket store is a bounded LRU (MAX_BUCKETS) so many distinct
+    keys over a pod's lifetime cannot grow memory without bound.
+
+    Exempt paths: health checks. Exceeding the rate returns 429 + Retry-After.
     """
 
     HEALTH_PATHS = {"/", "/health", "/healthz"}
+    MAX_BUCKETS = 1024
 
     def __init__(self, app, max_requests: int = 30, window_seconds: int = 60):
         self.app = app
         self.max_requests = max_requests
         self.window_seconds = window_seconds
-        self._buckets: dict[str, list] = {}  # ip -> [tokens, last_refill]
+        self._buckets: OrderedDict[str, list] = OrderedDict()  # key -> [tokens, last_refill]
         self._lock = asyncio.Lock()
 
-    def _get_path(self, scope):
-        path = scope.get("path", "")
-        for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
-            if path.startswith(prefix):
-                return path[len(prefix):] or "/"
-        return path
+    def _bucket_key(self, scope) -> str:
+        person = current_person.get()
+        if person:
+            return f"person:{person}"
+        return f"ip:{get_client_ip(scope)}"
 
-    def _get_client_ip(self, scope):
-        headers = {name.lower(): value for name, value in scope.get("headers", [])}
-        cf_ip = headers.get(b"cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.decode("latin-1").strip()
-        xff = headers.get(b"x-forwarded-for")
-        if xff:
-            return xff.decode("latin-1").split(",")[0].strip()
-        client = scope.get("client")
-        return client[0] if client else "unknown"
-
-    def _consume(self, ip: str) -> bool:
+    def _consume(self, key: str) -> bool:
         import time as _time
+
         now = _time.monotonic()
-        bucket = self._buckets.get(ip)
+        bucket = self._buckets.get(key)
         if bucket is None:
+            while len(self._buckets) >= self.MAX_BUCKETS:
+                self._buckets.popitem(last=False)  # evict least-recently-used key
             bucket = [float(self.max_requests), now]
-            self._buckets[ip] = bucket
+            self._buckets[key] = bucket
+        else:
+            self._buckets.move_to_end(key)
         tokens, last = bucket
         elapsed = now - last
         refill_rate = self.max_requests / self.window_seconds
@@ -792,25 +907,29 @@ class RateLimiterMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            path = self._get_path(scope)
+            path = get_path(scope)
             if path not in self.HEALTH_PATHS:
-                ip = self._get_client_ip(scope)
+                key = self._bucket_key(scope)
                 async with self._lock:
-                    allowed = self._consume(ip)
+                    allowed = self._consume(key)
                 if not allowed:
-                    logger.warning("Rate limit exceeded for %s", ip)
-                    await send({
-                        "type": "http.response.start",
-                        "status": 429,
-                        "headers": [
-                            [b"content-type", b"application/json"],
-                            [b"retry-after", str(self.window_seconds).encode()],
-                        ],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"too_many_requests","message":"Rate limit exceeded"}',
-                    })
+                    logger.warning("Rate limit exceeded for %s", key)
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 429,
+                            "headers": [
+                                [b"content-type", b"application/json"],
+                                [b"retry-after", str(self.window_seconds).encode()],
+                            ],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"error":"too_many_requests","message":"Rate limit exceeded"}',
+                        }
+                    )
                     return
         await self.app(scope, receive, send)
 
@@ -818,24 +937,37 @@ class RateLimiterMiddleware:
 class IPAllowlistMiddleware:
     """ASGI middleware that restricts access to allowed IPs/CIDRs.
 
-    Two ways to pass:
+    Three ways to pass:
       1. Client IP is in ``ALLOWED_IPS`` (CIDRs read from env).
-      2. Request carries a valid ``Authorization: Bearer <AUTH_TOKEN>`` — bypasses
-         the IP check for ops/backend callers from non-whitelisted hosts.
+      2. Request carries a valid ``Authorization: Bearer <AUTH_TOKEN>`` — the
+         shared static token (legacy, retired in M4).
+      3. Request carries a valid per-person token (LOOP-664): when a non-empty
+         ``PersonTokenRegistry`` is injected, any token it recognises grants the
+         same IP bypass. A person token is a stronger, revocable credential, so
+         — like ``AUTH_TOKEN`` — it lets a caller reach the service from a
+         non-whitelisted host. This is independent of ``PERSON_AUTH_ENABLED``,
+         which governs whether a person token is *required*, not whether it
+         grants network access.
 
     Health check paths are always exempt so ALB probes continue working.
-    If ``ALLOWED_IPS`` is empty AND ``AUTH_TOKEN`` is empty, all traffic is allowed
-    (backwards compatible).
+    If ``ALLOWED_IPS`` is empty, all traffic is allowed (backwards compatible);
+    the bearer bypasses only matter once an allowlist is configured.
     """
 
     HEALTH_PATHS = {"/", "/health", "/healthz"}
 
-    def __init__(self, app):
+    def __init__(self, app, registry: "PersonTokenRegistry | None" = None):
         self.app = app
         self.allowed_networks = self._load_allowed_ips()
         self._auth_token = os.getenv("AUTH_TOKEN", "").strip()
+        self._person_registry = registry
         if self._auth_token:
             logger.info("IP allowlist: static Bearer token bypass enabled")
+        if self._person_registry is not None and len(self._person_registry) > 0:
+            logger.info(
+                "IP allowlist: person-token bypass enabled (%d token(s))",
+                len(self._person_registry),
+            )
 
     def _load_allowed_ips(self):
         raw = os.getenv("ALLOWED_IPS", "").strip()
@@ -890,42 +1022,78 @@ class IPAllowlistMiddleware:
         path = scope.get("path", "")
         for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
-                return path[len(prefix):] or "/"
+                return path[len(prefix) :] or "/"
         return path
 
-    def _has_valid_bearer(self, scope) -> bool:
-        """Return True when the request carries a valid static Bearer token."""
-        if not self._auth_token:
-            return False
+    @staticmethod
+    def _extract_bearer(scope) -> str:
         headers = {name.lower(): value for name, value in scope.get("headers", [])}
         auth = headers.get(b"authorization", b"").decode("latin-1")
         if not auth.startswith("Bearer "):
-            return False
-        presented = auth[len("Bearer "):].strip()
-        return bool(presented) and hmac.compare_digest(presented, self._auth_token)
+            return ""
+        return auth[len("Bearer ") :].strip()
+
+    def _matches_auth_token(self, presented: str) -> bool:
+        """Constant-time check that ``presented`` equals the shared AUTH_TOKEN."""
+        return bool(self._auth_token) and bool(presented) and hmac.compare_digest(presented, self._auth_token)
+
+    def _resolve_person(self, presented: str) -> "str | None":
+        """Return the person name for a valid per-person token, else None.
+
+        ``registry.verify`` scans every entry with ``hmac.compare_digest`` (no
+        early exit), so timing does not leak which token, if any, matched.
+        """
+        if not presented or self._person_registry is None:
+            return None
+        return self._person_registry.verify(presented)
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and self.allowed_networks is not None:
-            path = self._get_path(scope)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
 
+        # Resolve any presented credential once: use it both to grant IP bypass
+        # and to attribute the request in the audit trail. Resolving the person
+        # here (not just in PersonAuthMiddleware) means a person-token caller is
+        # named in the audit log even while PERSON_AUTH_ENABLED is off — the
+        # migration window where person tokens are live but enforcement is not.
+        presented = self._extract_bearer(scope)
+        person = self._resolve_person(presented)
+
+        if self.allowed_networks is not None:
+            path = self._get_path(scope)
             # Always allow health check paths (ALB probes)
             if path not in self.HEALTH_PATHS:
                 client_ip = self._get_client_ip(scope)
-
-                if not self._is_allowed(client_ip) and not self._has_valid_bearer(scope):
+                bypass = self._matches_auth_token(presented) or person is not None
+                if not self._is_allowed(client_ip) and not bypass:
                     logger.warning(f"Blocked request from {client_ip} to {scope.get('path', '')}")
-                    await send({
-                        "type": "http.response.start",
-                        "status": 403,
-                        "headers": [[b"content-type", b"application/json"]],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b'{"error":"forbidden","message":"IP not allowed"}',
-                    })
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 403,
+                            "headers": [[b"content-type", b"application/json"]],
+                        }
+                    )
+                    await send(
+                        {
+                            "type": "http.response.body",
+                            "body": b'{"error":"forbidden","message":"IP not allowed"}',
+                        }
+                    )
                     return
 
-        await self.app(scope, receive, send)
+        # Attribute a person-token caller downstream. PersonAuthMiddleware (inner)
+        # sets the same value again when the flag is on; nested set/reset is
+        # LIFO-safe since this middleware wraps it.
+        if person is not None:
+            token = current_person.set(person)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                current_person.reset(token)
+        else:
+            await self.app(scope, receive, send)
 
 
 class CallerIdentityMiddleware:
@@ -967,19 +1135,23 @@ class CallerIdentityMiddleware:
         path = scope.get("path", "")
         for prefix in ("/postgres-mcp", "/db-mcp", "/instagram-mcp"):
             if path.startswith(prefix):
-                return path[len(prefix):] or "/"
+                return path[len(prefix) :] or "/"
         return path
 
     async def _deny(self, send, status, err, msg):
-        await send({
-            "type": "http.response.start",
-            "status": status,
-            "headers": [[b"content-type", b"application/json"]],
-        })
-        await send({
-            "type": "http.response.body",
-            "body": f'{{"error":"{err}","message":"{msg}"}}'.encode(),
-        })
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [[b"content-type", b"application/json"]],
+            }
+        )
+        await send(
+            {
+                "type": "http.response.body",
+                "body": f'{{"error":"{err}","message":"{msg}"}}'.encode(),
+            }
+        )
 
     async def __call__(self, scope, receive, send):
         if not self.enabled or scope["type"] != "http":
@@ -990,9 +1162,7 @@ class CallerIdentityMiddleware:
             return
 
         headers = {k.lower(): v for k, v in scope.get("headers", [])}
-        transport_trusted = caller_identity.is_transport_trusted(
-            headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens
-        )
+        transport_trusted = caller_identity.is_transport_trusted(headers, auth_token=self._auth_token, superadmin_tokens=self._sa_tokens)
         # P2: pre-resolve a Tier-2 galactus token OFF the event loop so the
         # blocking HTTP call doesn't freeze the single replica; hand
         # resolve_identity a memoized validator so it stays pure/sync.
@@ -1072,7 +1242,7 @@ class SSEKeepAliveMiddleware:
 
             if message["type"] == "http.response.body":
                 # Start pinging after the first body chunk (SSE stream opened)
-                if response_started and ping_task is None and not message.get("more_body", True) is False:
+                if response_started and ping_task is None and message.get("more_body", True) is not False:
                     ping_task = asyncio.create_task(self._ping_loop(send))
                 await send(message)
                 return
@@ -1094,11 +1264,13 @@ class SSEKeepAliveMiddleware:
         while True:
             await asyncio.sleep(self.interval)
             try:
-                await send({
-                    "type": "http.response.body",
-                    "body": b":ping\n\n",
-                    "more_body": True,
-                })
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b":ping\n\n",
+                        "more_body": True,
+                    }
+                )
             except (OSError, BrokenPipeError, ConnectionResetError, RuntimeError):
                 # Connection closed or broken pipe, stop pinging
                 logger.debug("SSE ping loop ended: connection closed")
@@ -1128,7 +1300,7 @@ class HealthCheckMiddleware:
             # Set root_path so SSE transport includes the prefix in endpoint URLs
             for prefix in self.PATH_PREFIXES:
                 if path.startswith(prefix):
-                    path = path[len(prefix):] or "/"
+                    path = path[len(prefix) :] or "/"
                     scope = dict(scope, path=path, root_path=prefix)
                     break
 
@@ -1228,6 +1400,53 @@ class HealthCheckMiddleware:
         await self.app(scope, receive, send)
 
 
+def build_middleware_stack(terminal_app):
+    """Compose the full perimeter chain around a terminal ASGI app.
+
+    Single source of truth for middleware ORDER — main() and the integration
+    tests both use this, so an ordering regression cannot slip past tests.
+
+    Middleware stack (outermost → innermost):
+    0. RequestIDMiddleware — assigns correlation ID to every request
+    1. CORSMiddleware — handles OPTIONS preflight + CORS headers
+    2. IPAllowlistMiddleware — allows whitelisted IPs OR a valid AUTH_TOKEN /
+       person-token Bearer (LOOP-664; AUTH_TOKEN retired in M4)
+    3. PersonAuthMiddleware — per-person bearer tokens (LOOP-664 M1, PERSON_AUTH_ENABLED)
+    4. AuditLogMiddleware — one JSON audit line per request (LOOP-664 M1)
+    5. CallerIdentityMiddleware — legacy end-user identity gating (frozen path, retired in M4)
+    6. RateLimiterMiddleware — person-keyed (fallback per-IP) rate limiting
+    7. HealthCheckMiddleware — ALB health probes
+    8. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts (SSE retired in M4)
+
+    The person-token registry is parsed ONCE here and shared by the IP allowlist
+    (person tokens grant IP bypass) and PersonAuth (person tokens are the identity
+    credential), so the two can never disagree on which tokens are valid. A
+    malformed ``PERSON_TOKENS`` fails loud at this point.
+    """
+    registry = PersonTokenRegistry()
+    return RequestIDMiddleware(
+        CORSMiddleware(
+            IPAllowlistMiddleware(
+                PersonAuthMiddleware(
+                    AuditLogMiddleware(
+                        CallerIdentityMiddleware(
+                            RateLimiterMiddleware(
+                                HealthCheckMiddleware(SSEKeepAliveMiddleware(terminal_app, interval=15)),
+                                max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
+                                window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
+                            )
+                        ),
+                        get_request_id=lambda: _request_id_var.get(""),
+                    ),
+                    registry=registry,
+                    get_request_id=lambda: _request_id_var.get(""),
+                ),
+                registry=registry,
+            )
+        )
+    )
+
+
 def build_dual_transport_router(mcp_server):
     """ASGI app serving one FastMCP server over BOTH transports — SSE at
     ``/sse`` + ``/messages`` and Streamable-HTTP at ``/mcp`` — while driving the
@@ -1313,11 +1532,9 @@ async def main():
 
     # Add the query tool with a description appropriate to the access mode
     if current_access_mode == AccessMode.UNRESTRICTED:
-        mcp.add_tool(execute_sql, description="Execute any SQL query",
-                     annotations=types.ToolAnnotations(readOnlyHint=False))
+        mcp.add_tool(execute_sql, description="Execute any SQL query", annotations=types.ToolAnnotations(readOnlyHint=False))
     else:
-        mcp.add_tool(execute_sql, description="Execute a read-only SQL query",
-                     annotations=types.ToolAnnotations(readOnlyHint=True))
+        mcp.add_tool(execute_sql, description="Execute a read-only SQL query", annotations=types.ToolAnnotations(readOnlyHint=True))
 
     logger.info(f"Starting PostgreSQL MCP Server in {current_access_mode.upper()} mode")
 
@@ -1362,9 +1579,7 @@ async def main():
 
         # Configure transport security to allow all hosts (like eden_gardens' ALLOWED_HOSTS = "*")
         # This disables DNS rebinding protection for compatibility with load balancers and ingress
-        mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
-        )
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
 
         import uvicorn
 
@@ -1375,31 +1590,10 @@ async def main():
         # /mcp request 500'd with "Task group is not initialized" (LOOP-511).
         route_by_transport = build_dual_transport_router(mcp)
 
-        # Middleware stack (outermost → innermost):
-        # 0. RequestIDMiddleware — assigns correlation ID to every request
-        # 1. CORSMiddleware — handles OPTIONS preflight + CORS headers
-        # 2. IPAllowlistMiddleware — allows whitelisted IPs OR valid AUTH_TOKEN Bearer
-        # 3. RateLimiterMiddleware — per-IP rate limiting
-        # 4. HealthCheckMiddleware — ALB health probes
-        # 5. SSEKeepAliveMiddleware — SSE ping to prevent idle timeouts
-        wrapped_app = RequestIDMiddleware(
-            CORSMiddleware(
-                IPAllowlistMiddleware(
-                    CallerIdentityMiddleware(
-                        RateLimiterMiddleware(
-                            HealthCheckMiddleware(
-                                SSEKeepAliveMiddleware(route_by_transport, interval=15)
-                            ),
-                            max_requests=int(os.environ.get("RATE_LIMIT_MAX_REQUESTS", "30")),
-                            window_seconds=int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "60")),
-                        )
-                    )
-                )
-            )
-        )
+        wrapped_app = build_middleware_stack(route_by_transport)
         logger.info(
             "Applied middleware stack: RequestID + CORS + IPAllowlist(+TokenBypass) + "
-            "CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
+            "PersonAuth + AuditLog + CallerIdentity + RateLimiter + HealthCheck + SSEKeepAlive"
         )
 
         # Attach request-ID filter to root logger so all log records include it
@@ -1437,6 +1631,16 @@ async def shutdown(sig=None):
         logger.info("Closed database connections")
     except Exception as e:
         logger.error(f"Error closing database connections: {e}")
+
+    # Close any downstream proxy MCP clients (multi-domain router). No-op when
+    # multi-domain routing was never enabled (the client cache stays empty).
+    try:
+        from . import downstream_client
+
+        await downstream_client.close_all_clients()
+        logger.info("Closed downstream MCP clients")
+    except Exception as e:
+        logger.error(f"Error closing downstream MCP clients: {e}")
 
     # Exit with appropriate status code
     sys.exit(128 + sig.value if sig is not None else 0)

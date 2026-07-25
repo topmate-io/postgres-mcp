@@ -15,7 +15,7 @@ def _tools():
 def test_all_static_read_tools_have_readonly_hint():
     tools = _tools()
     static = {n: t for n, t in tools.items() if n != "execute_sql"}
-    assert len(static) == 11, sorted(static)
+    assert len(static) == 12, sorted(static)
     for name, t in static.items():
         assert t.annotations is not None and t.annotations.readOnlyHint is True, name
 
@@ -24,7 +24,8 @@ def _register_execute_sql(readonly: bool):
     # add_tool refuses to overwrite, so drop any prior registration first.
     s.mcp._tool_manager._tools.pop("execute_sql", None)
     s.mcp.add_tool(
-        s.execute_sql, description="x",
+        s.execute_sql,
+        description="x",
         annotations=ToolAnnotations(readOnlyHint=readonly),
     )
 
