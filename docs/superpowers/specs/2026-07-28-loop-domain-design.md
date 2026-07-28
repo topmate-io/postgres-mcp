@@ -1,7 +1,43 @@
 # LOOP-664 phase 3 — `loop` domain (RYL agents platform, ryl_beta)
 
-Status: **role + sidecar LIVE and verified on ryl-beta-host; exposure blocked on DNS/TLS.**
+Status: **SHIPPED — live end-to-end through `mcp.gabbanext.run`.**
 Date: 2026-07-28.
+
+## Shipped
+
+`execute_sql(domain='loop')` -> `ryl_beta` as `mcp_readonly`; 235 paying
+creators; writes refused; `tm` unaffected. Path:
+
+```
+mcp.gabbanext.run/postgres-mcp/mcp  (router, image 5d385c6-*)
+   -> https://loop-mcp.ryloop.co/mcp  (bearer from LOOP_MCP_TOKEN)
+      -> loop-mcp sidecar on ryl-beta-host  (PERSON_AUTH_ENABLED=true)
+         -> ryl-beta-db / ryl_beta  as mcp_readonly (SELECT-only + BYPASSRLS)
+```
+
+Infra: ACM cert `41a43a6d` (SNI on the `ryl-beta-alb` :443 listener), target
+group `ryl-beta-loop-mcp-tg`, listener rule priority 30, SG rule
+`sgr-0136427400f64f8cf` (:8000 from the ALB SG only), Cloudflare DNS-only CNAME.
+
+**Rolled with `kubectl patch`, never `kubectl apply`** — the live image is
+pinned while the manifest says `:latest`, so applying it would silently swap the
+running image. Only the pinned tag was pushed; `:latest` was left alone so the
+four sibling per-DB MCPs don't pick this up on their next restart.
+
+### RLS, the thing that nearly shipped a wrong number
+
+25 of 131 tables in `ryl_beta` carry tenant-isolation RLS keyed on
+`current_setting('app.creator_id')`. A role without `BYPASSRLS` matches zero
+rows and returns an **empty success, not an error** — during bring-up that
+turned a 4,847-row table into a confident `paying_creators: 0`. `mcp_readonly`
+now holds `BYPASSRLS` (read visibility only; `non_select_privs=0`,
+`rolsuper=false`), `provision_loop_domain.sh` sets it unconditionally so a
+re-provision cannot reintroduce the blindness, and the guide + unit tests pin
+the warning.
+
+Corollary: `creator_credit_balances` (235 paying) and `kelviq_subscription_mirror`
+(57 "active") disagree ~4x. Balances is the entitlement Loop enforces; the mirror
+is a gateway snapshot whose `creator_id` is NULL on ~96% of rows.
 
 ## Live state (verified 2026-07-28)
 
