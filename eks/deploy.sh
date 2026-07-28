@@ -197,11 +197,38 @@ if [ "$SKIP_SECRETS" = false ]; then
   # perimeter on this service is the access gate. See the internal design spec for
   # the downstream trust-boundary rationale.
 
+  # LOOP-664 phase 3: `loop` is the one OUT-OF-CLUSTER domain (ryl-beta-db lives in
+  # ryl-beta-vpc with no peering), so the router reaches it over HTTPS and must
+  # present a bearer. Without this key the loop domain 502s after every deploy.
+  LOOP_MCP_TOKEN=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/loop-mcp-token \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "  WARN: topmate/postgres-mcp/loop-mcp-token not found — the 'loop' domain will fail to route."
+    LOOP_MCP_TOKEN=""
+  }
+
+  # Consumed by deployment-db-mcp-server.yaml. It is the RAW svc-db-mcp person
+  # token (sha256 of it is the svc-db-mcp entry in person-tokens above), i.e. how
+  # db-mcp authenticates INTO this service.
+  DB_MCP_POSTGRES_TOKEN=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/db-mcp-postgres-token \
+    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
+    echo "  WARN: topmate/postgres-mcp/db-mcp-postgres-token not found — db-mcp-server cannot reach postgres-mcp."
+    DB_MCP_POSTGRES_TOKEN=""
+  }
+
+  # NOTE: this is `kubectl apply` of a fully-specified Secret, so it REPLACES the
+  # whole data map — any key not listed here is silently deleted. Two keys were
+  # already being dropped this way (loop-mcp-token, db-mcp-postgres-token). If you
+  # add a key to this secret out-of-band, add it here too or the next deploy
+  # removes it, and the failure shows up as a 401/502 in a different service.
   kubectl create secret generic postgres-mcp-secrets \
     --from-literal=database-uri="${DATABASE_URI}" \
     --from-literal=logic-hub-url="${LOGIC_HUB_URL}" \
     --from-literal=logic-hub-api-key="${LOGIC_HUB_API_KEY}" \
     --from-literal=person-tokens="${PERSON_TOKENS_JSON}" \
+    --from-literal=loop-mcp-token="${LOOP_MCP_TOKEN}" \
+    --from-literal=db-mcp-postgres-token="${DB_MCP_POSTGRES_TOKEN}" \
     -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 

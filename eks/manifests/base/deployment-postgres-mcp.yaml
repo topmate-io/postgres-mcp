@@ -144,9 +144,22 @@ spec:
             # Service DNS is intra-namespace (postgres-mcp), so short names resolve.
             # All Services below expose port 80 -> targetPort 8000 (no :8000 suffix
             # on base_url); the downstream client appends /mcp itself.
+            # `loop` is the one out-of-cluster domain: ryl-beta-db lives in
+            # ryl-beta-vpc with no peering to this VPC, so it is reached over
+            # HTTPS via a sidecar MCP running inside that VPC. That hop is
+            # public, so unlike the in-cluster entries it MUST carry a bearer
+            # (token_env) and the sidecar MUST run PERSON_AUTH_ENABLED=true --
+            # an empty ALLOWED_IPS means allow-all, and AUTH_TOKEN only
+            # *bypasses* the IP check, it never *requires* a token.
             - name: DOMAIN_REGISTRY_JSON
               value: >-
-                {"igdm":{"base_url":"http://instagram-mcp-service","transport":"streamable_http","database":"instagram_auto_dm"},"fin_ledger":{"base_url":"http://postgres-mcp-v2-ledger-service","transport":"streamable_http","database":"ledger_db"},"fin_payment":{"base_url":"http://postgres-mcp-v2-payment-service","transport":"streamable_http","database":"payment_db"},"fin_payout":{"base_url":"http://postgres-mcp-v2-payout-service","transport":"streamable_http","database":"payout_db"}}
+                {"igdm":{"base_url":"http://instagram-mcp-service","transport":"streamable_http","database":"instagram_auto_dm"},"fin_ledger":{"base_url":"http://postgres-mcp-v2-ledger-service","transport":"streamable_http","database":"ledger_db"},"fin_payment":{"base_url":"http://postgres-mcp-v2-payment-service","transport":"streamable_http","database":"payment_db"},"fin_payout":{"base_url":"http://postgres-mcp-v2-payout-service","transport":"streamable_http","database":"payout_db"},"loop":{"base_url":"https://loop-mcp.ryloop.co","transport":"streamable_http","database":"ryl_beta","token_env":"LOOP_MCP_TOKEN"}}
+            - name: LOOP_MCP_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-mcp-secrets
+                  key: loop-mcp-token
+                  optional: true
           resources:
             requests:
               memory: "512Mi"

@@ -513,7 +513,7 @@ async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
     domain: str = Field(
         description="Which database to query: 'tm' (Topmate core, default), 'igdm', "
-        "'fin_ledger', 'fin_payment', 'fin_payout'. Call get_schema_guide first.",
+        "'fin_ledger', 'fin_payment', 'fin_payout', 'loop'. Call get_schema_guide first.",
         default="tm",
     ),
 ) -> ResponseType:

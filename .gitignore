@@ -183,6 +183,8 @@ devenv.local.nix
 # pre-commit
 .pre-commit-config.yaml
 *.sql
+# ...but scripts/ holds checked-in operational DDL (role provisioning), not dumps.
+!scripts/*.sql
 
 # EKS deploy secrets
 eks/allowed-ips.env
