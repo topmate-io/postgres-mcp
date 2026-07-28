@@ -217,18 +217,37 @@ async def list_schemas(
         return proxied
     try:
         sql_driver = await get_sql_driver()
+        # pg_namespace, NOT information_schema.schemata. Per the SQL standard,
+        # schemata only exposes schemas the current role owns or holds privileges
+        # on, so a least-privilege reader silently sees a SHORT list and cannot
+        # tell it is incomplete. Concretely: ryl_beta's `dbos` schema (owned by
+        # ryl_admin) was invisible to the read-only MCP role while plainly
+        # present in pg_namespace. An incomplete answer that looks authoritative
+        # is the failure mode this whole domain has been bitten by twice.
+        #
+        # Ordering is explicit rather than alphabetical-by-type: the old
+        # `ORDER BY schema_type` put 'User Schema' last, behind ~500 pg_temp_*
+        # rows, which is why callers reported "hundreds of entries, almost all
+        # internals" and stopped reading before the real schemas.
         rows = await sql_driver.execute_query(
             """
             SELECT
-                schema_name,
-                schema_owner,
+                n.nspname AS schema_name,
+                pg_get_userbyid(n.nspowner) AS schema_owner,
                 CASE
-                    WHEN schema_name LIKE 'pg_%' THEN 'System Schema'
-                    WHEN schema_name = 'information_schema' THEN 'System Information Schema'
+                    WHEN n.nspname LIKE 'pg_temp%' OR n.nspname LIKE 'pg_toast%' THEN 'Temporary Schema'
+                    WHEN n.nspname = 'information_schema' THEN 'System Information Schema'
+                    WHEN n.nspname LIKE 'pg_%' THEN 'System Schema'
                     ELSE 'User Schema'
-                END as schema_type
-            FROM information_schema.schemata
-            ORDER BY schema_type, schema_name
+                END AS schema_type
+            FROM pg_namespace n
+            ORDER BY
+                CASE
+                    WHEN n.nspname LIKE 'pg_temp%' OR n.nspname LIKE 'pg_toast%' THEN 3
+                    WHEN n.nspname LIKE 'pg_%' OR n.nspname = 'information_schema' THEN 2
+                    ELSE 1
+                END,
+                n.nspname
             """
         )
         schemas = [row.cells for row in rows] if rows else []
