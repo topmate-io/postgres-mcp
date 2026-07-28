@@ -7,9 +7,13 @@
 #   aws ssm start-session --target i-0a4de19cc55a0d0ca --profile topmate-prod
 #   sudo -i; curl -fsSL <this file> -o /tmp/prov.sh; bash /tmp/prov.sh
 #
-# Idempotent: re-running skips the role if it already exists and recreates the
-# container in place. Prints ONE secret at the end (the router bearer) — copy it
-# straight into AWS Secrets Manager, do not paste it into a chat or a ticket.
+# Idempotent per host: re-running rotates only THIS host's login-role password
+# and recreates its container in place. Set LOOP_MCP_ROLE to a distinct name on
+# each host (see the role section) so one host's rotation cannot invalidate
+# another's baked-in DSN.
+#
+# Requires LOOP_MCP_DIGEST — the sha256 of the router bearer. The bearer itself
+# is minted operator-side and never reaches this host; nothing secret is printed.
 set -euo pipefail
 
 IMAGE="072528252688.dkr.ecr.ap-south-1.amazonaws.com/topmate-postgres-mcp:latest"
@@ -31,38 +35,54 @@ $PSQL "$ADMIN_DSN" -At -c "SELECT current_user || ' can_create_role=' || rolcrea
 $PSQL "$ADMIN_DSN" -At -c "SELECT 'public tables: ' || count(*) FROM information_schema.tables WHERE table_schema='public'"
 
 # ------------------------------------------------------------------- role
-if [ "$($PSQL "$ADMIN_DSN" -At -c "SELECT count(*) FROM pg_roles WHERE rolname='mcp_readonly'")" = "1" ]; then
-  say "Role mcp_readonly already exists — reusing, rotating password"
-  # Alphanumeric only: the password goes into a DSN, and percent-encoding it
-  # would need jq/python that may not be on the host. 48 chars of [A-Za-z0-9]
-  # is ~285 bits, so dropping the symbol class costs nothing.
-  MCP_PW="$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | cut -c1-48)"
-  $PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "ALTER ROLE mcp_readonly PASSWORD '$MCP_PW'"
-else
-  say "Creating mcp_readonly (SELECT-only, CONNECTION LIMIT 4)"
-  # Alphanumeric only: the password goes into a DSN, and percent-encoding it
-  # would need jq/python that may not be on the host. 48 chars of [A-Za-z0-9]
-  # is ~285 bits, so dropping the symbol class costs nothing.
-  MCP_PW="$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | cut -c1-48)"
+# ONE LOGIN ROLE PER HOST. All grants live on the NOLOGIN group mcp_readonly_grp,
+# so each sidecar host gets its own login role and therefore its own password,
+# generated locally and never transmitted. A single shared role would make this
+# script unsafe to run on a second host: it rotates the password, which would
+# invalidate the DSN already baked into the first host's container.
+#   host 1: LOOP_MCP_ROLE=mcp_readonly (default)
+#   host 2: LOOP_MCP_ROLE=mcp_readonly_h2
+ROLE="${LOOP_MCP_ROLE:-mcp_readonly}"
+GRP=mcp_readonly_grp
+
+# Alphanumeric only: the password goes into a DSN, and percent-encoding it would
+# need jq/python that may not be on the host. 48 chars of [A-Za-z0-9] is ~285
+# bits, so dropping the symbol class costs nothing.
+MCP_PW="$(openssl rand -base64 96 | tr -dc 'A-Za-z0-9' | cut -c1-48)"
+
+if [ "$($PSQL "$ADMIN_DSN" -At -c "SELECT count(*) FROM pg_roles WHERE rolname='$GRP'")" = "0" ]; then
+  say "Creating grant-holder group $GRP"
   $PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 <<SQL
 BEGIN;
-CREATE ROLE mcp_readonly_grp NOLOGIN;
-CREATE ROLE mcp_readonly LOGIN PASSWORD '$MCP_PW' CONNECTION LIMIT 4 IN ROLE mcp_readonly_grp;
-ALTER ROLE mcp_readonly SET statement_timeout = '30s';
-ALTER ROLE mcp_readonly SET idle_in_transaction_session_timeout = '10s';
-ALTER ROLE mcp_readonly SET default_transaction_read_only = on;
-ALTER ROLE mcp_readonly SET lock_timeout = '2s';
-ALTER ROLE mcp_readonly SET work_mem = '32MB';
-GRANT CONNECT ON DATABASE $DB_NAME TO mcp_readonly_grp;
-GRANT USAGE ON SCHEMA public TO mcp_readonly_grp;
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO mcp_readonly_grp;
-GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO mcp_readonly_grp;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO mcp_readonly_grp;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO mcp_readonly_grp;
-REVOKE CREATE ON SCHEMA public FROM mcp_readonly_grp;
+CREATE ROLE $GRP NOLOGIN;
+GRANT CONNECT ON DATABASE $DB_NAME TO $GRP;
+GRANT USAGE ON SCHEMA public TO $GRP;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO $GRP;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO $GRP;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO $GRP;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO $GRP;
+REVOKE CREATE ON SCHEMA public FROM $GRP;
 COMMIT;
 SQL
+else
+  say "Grant-holder group $GRP already exists — leaving grants untouched"
 fi
+
+if [ "$($PSQL "$ADMIN_DSN" -At -c "SELECT count(*) FROM pg_roles WHERE rolname='$ROLE'")" = "1" ]; then
+  say "Login role $ROLE exists — rotating its password only (other hosts unaffected)"
+  $PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "ALTER ROLE $ROLE PASSWORD '$MCP_PW'"
+else
+  say "Creating login role $ROLE (SELECT-only via $GRP, CONNECTION LIMIT 4)"
+  $PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "CREATE ROLE $ROLE LOGIN PASSWORD '$MCP_PW' CONNECTION LIMIT 4 IN ROLE $GRP"
+fi
+
+$PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 <<SQL
+ALTER ROLE $ROLE SET statement_timeout = '30s';
+ALTER ROLE $ROLE SET idle_in_transaction_session_timeout = '10s';
+ALTER ROLE $ROLE SET default_transaction_read_only = on;
+ALTER ROLE $ROLE SET lock_timeout = '2s';
+ALTER ROLE $ROLE SET work_mem = '32MB';
+SQL
 
 # 25 of 131 tables carry tenant-isolation RLS keyed on current_setting('app.creator_id').
 # Without BYPASSRLS this role matches zero rows on all of them and returns an EMPTY
@@ -70,25 +90,25 @@ fi
 # "paying_creators: 0". Set unconditionally so a re-provision cannot silently
 # reintroduce that blindness. It confers read visibility only, never write.
 say "Granting BYPASSRLS (tenant-isolation RLS would otherwise return silent zeros)"
-$PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "ALTER ROLE mcp_readonly BYPASSRLS"
+$PSQL "$ADMIN_DSN" -v ON_ERROR_STOP=1 -c "ALTER ROLE $ROLE BYPASSRLS"
 
 say "Verifying the role really is read-only"
 $PSQL "$ADMIN_DSN" -At -c "
   SELECT 'super='||rolsuper||' createdb='||rolcreatedb||' createrole='||rolcreaterole||' bypassrls='||rolbypassrls
-    FROM pg_roles WHERE rolname='mcp_readonly'"
+    FROM pg_roles WHERE rolname='$ROLE'"
 NONSELECT=$($PSQL "$ADMIN_DSN" -At -c "
   SELECT count(*) FROM information_schema.table_privileges
-   WHERE grantee IN ('mcp_readonly','mcp_readonly_grp') AND privilege_type <> 'SELECT'")
-[ "$NONSELECT" = "0" ] || { echo "FATAL: mcp_readonly holds $NONSELECT non-SELECT privileges"; exit 1; }
+   WHERE grantee IN ('$ROLE','$GRP') AND privilege_type <> 'SELECT'")
+[ "$NONSELECT" = "0" ] || { echo "FATAL: $ROLE holds $NONSELECT non-SELECT privileges"; exit 1; }
 echo "non-SELECT privileges: 0 — OK"
 # BYPASSRLS must be on (read visibility) while every escalation flag stays off.
 ATTRS=$($PSQL "$ADMIN_DSN" -At -c "
-  SELECT rolsuper::int || rolcreatedb::int || rolcreaterole::int || rolbypassrls::int
-    FROM pg_roles WHERE rolname='mcp_readonly'")
+  SELECT rolsuper::int::text || rolcreatedb::int::text || rolcreaterole::int::text || rolbypassrls::int::text
+    FROM pg_roles WHERE rolname='$ROLE'")
 [ "$ATTRS" = "0001" ] || { echo "FATAL: expected super/createdb/createrole/bypassrls = 0,0,0,1 — got $ATTRS"; exit 1; }
 echo "attributes super=0 createdb=0 createrole=0 bypassrls=1 — OK"
 
-RO_DSN="postgresql://mcp_readonly:${MCP_PW}@${DB_HOST}:5432/${DB_NAME}"
+RO_DSN="postgresql://${ROLE}:${MCP_PW}@${DB_HOST}:5432/${DB_NAME}"
 
 say "Proving the write path is closed at the DB layer"
 # Do NOT pipe psql straight into grep: `set -o pipefail` would surface psql's
