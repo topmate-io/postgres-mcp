@@ -186,9 +186,35 @@ async def _maybe_proxy(domain: str, tool_name: str, arguments: dict) -> Response
     return await _call_downstream(domain, tool_name, arguments)
 
 
+# ONE definition shared by every domain-aware tool. This list was previously
+# duplicated per-tool, which is how `loop` shipped visible on execute_sql but
+# missing everywhere else. It is deliberately a static string rather than being
+# built from domain_registry: MCP clients cache the tool schema at connect time,
+# so a description that varied with server env would differ between replicas and
+# between reconnects. Update this string when a domain is added.
+DOMAIN_FIELD_DESC = (
+    "Which database to query: 'tm' (Topmate core, default), 'igdm', 'fin_ledger', 'fin_payment', 'fin_payout', 'loop'. Call get_schema_guide first."
+)
+
+# Tools whose answer is curated Topmate content or router-level metadata rather
+# than a query against the selected database. Proxying these would return the
+# downstream's copy of Topmate-specific prose for a database it does not describe,
+# which is worse than refusing -- so they stay tm-only and say so in their
+# description. Listed here so the omission reads as a decision, not an oversight:
+#   get_schema_guide                 -- the multi-domain routing index itself
+#   get_topmate_schema_guide         -- Topmate column/table detail
+#   get_topmate_troubleshooting_guide-- Topmate runbook prose
+#   get_business_logic_patterns      -- Topmate business rules
+
+
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
-async def list_schemas() -> ResponseType:
+async def list_schemas(
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
+) -> ResponseType:
     """List all schemas in the database."""
+    proxied = await _maybe_proxy(domain, "list_schemas", {})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
         rows = await sql_driver.execute_query(
@@ -216,7 +242,7 @@ async def list_schemas() -> ResponseType:
 async def list_objects(
     schema_name: str = Field(description="Schema name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
-    domain: str = Field(description="Target database domain", default="tm"),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """List objects of a given type in a schema."""
     proxied = await _maybe_proxy(domain, "list_objects", {"schema_name": schema_name, "object_type": object_type})
@@ -289,7 +315,7 @@ async def get_object_details(
     schema_name: str = Field(description="Schema name"),
     object_name: str = Field(description="Object name"),
     object_type: str = Field(description="Object type: 'table', 'view', 'sequence', or 'extension'", default="table"),
-    domain: str = Field(description="Target database domain", default="tm"),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """Get detailed information about a database object."""
     proxied = await _maybe_proxy(domain, "get_object_details", {"schema_name": schema_name, "object_name": object_name, "object_type": object_type})
@@ -445,6 +471,7 @@ Examples: [
 If there is no hypothetical index, you can pass an empty list.""",
         default=[],
     ),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """
     Explains the execution plan for a SQL query.
@@ -454,6 +481,9 @@ If there is no hypothetical index, you can pass an empty list.""",
         analyze: When True, actually runs the query for real statistics
         hypothetical_indexes: Optional list of indexes to simulate
     """
+    proxied = await _maybe_proxy(domain, "explain_query", {"sql": sql, "analyze": analyze, "hypothetical_indexes": hypothetical_indexes})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
         explain_tool = ExplainPlanTool(sql_driver=sql_driver)
@@ -511,11 +541,7 @@ If there is no hypothetical index, you can pass an empty list.""",
 @validate_call
 async def execute_sql(
     sql: str = Field(description="SQL to run", default="all"),
-    domain: str = Field(
-        description="Which database to query: 'tm' (Topmate core, default), 'igdm', "
-        "'fin_ledger', 'fin_payment', 'fin_payout', 'loop'. Call get_schema_guide first.",
-        default="tm",
-    ),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """Executes a read-only SQL query against the selected domain's database."""
     from .readonly_guard import is_read_only_sql
@@ -552,8 +578,12 @@ async def execute_sql(
 async def analyze_workload_indexes(
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """Analyze frequently executed queries in the database and recommend optimal indexes."""
+    proxied = await _maybe_proxy(domain, "analyze_workload_indexes", {"max_index_size_mb": max_index_size_mb, "method": method})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
         if method == "dta":
@@ -574,8 +604,12 @@ async def analyze_query_indexes(
     queries: list[str] = Field(description="List of Query strings to analyze"),
     max_index_size_mb: int = Field(description="Max index size in MB", default=10000),
     method: Literal["dta", "llm"] = Field(description="Method to use for analysis", default="dta"),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """Analyze a list of SQL queries and recommend optimal indexes."""
+    proxied = await _maybe_proxy(domain, "analyze_query_indexes", {"queries": queries, "max_index_size_mb": max_index_size_mb, "method": method})
+    if proxied is not None:
+        return proxied
     if len(queries) == 0:
         return format_error_response("Please provide a non-empty list of queries to analyze.")
     if len(queries) > MAX_NUM_INDEX_TUNING_QUERIES:
@@ -613,6 +647,7 @@ async def analyze_db_health(
         description=f"Optional. Valid values are: {', '.join(sorted([t.value for t in HealthType]))}.",
         default="all",
     ),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
     """Analyze database health for specified components.
 
@@ -620,6 +655,9 @@ async def analyze_db_health(
         health_type: Comma-separated list of health check types to perform.
                     Valid values: index, connection, vacuum, sequence, replication, buffer, constraint, all
     """
+    proxied = await _maybe_proxy(domain, "analyze_db_health", {"health_type": health_type})
+    if proxied is not None:
+        return proxied
     health_tool = DatabaseHealthTool(await get_sql_driver())
     result = await health_tool.health(health_type=health_type)
     return format_text_response(result)
@@ -637,7 +675,11 @@ async def get_top_queries(
         default="resources",
     ),
     limit: int = Field(description="Number of queries to return when ranking based on mean_time or total_time", default=10),
+    domain: str = Field(description=DOMAIN_FIELD_DESC, default="tm"),
 ) -> ResponseType:
+    proxied = await _maybe_proxy(domain, "get_top_queries", {"sort_by": sort_by, "limit": limit})
+    if proxied is not None:
+        return proxied
     try:
         sql_driver = await get_sql_driver()
         top_queries_tool = TopQueriesCalc(sql_driver=sql_driver)
@@ -658,8 +700,9 @@ async def get_top_queries(
 
 @mcp.tool(
     name="get_topmate_schema_guide",
-    description="Returns Topmate database schema reference with table descriptions, key columns, "
-    "common filters, and pre-built SQL query templates for GMV, bookings, and user metrics.",
+    description="domain='tm' ONLY. Returns Topmate database schema reference with table descriptions, key "
+    "columns, common filters, and pre-built SQL query templates for GMV, bookings, and user metrics. "
+    "Describes no other domain -- for those call get_schema_guide.",
     annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_topmate_schema_guide() -> ResponseType:
@@ -690,8 +733,9 @@ async def get_schema_guide() -> ResponseType:
 
 @mcp.tool(
     name="get_topmate_troubleshooting_guide",
-    description="Provides troubleshooting guidance for common SQL issues when querying Topmate database. "
-    "Covers slow queries, incorrect results, complex aggregations, booking queries, and user metrics.",
+    description="domain='tm' ONLY. Troubleshooting guidance for common SQL issues when querying the Topmate "
+    "database: slow queries, incorrect results, complex aggregations, booking queries, user metrics. "
+    "Describes no other domain.",
     annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_topmate_troubleshooting_guide() -> ResponseType:
@@ -711,7 +755,7 @@ async def get_topmate_troubleshooting_guide() -> ResponseType:
     name="get_business_logic_patterns",
     description="Provides comprehensive business logic patterns and SQL query guidance for complex scenarios. "
     "Fetches from Topmate Logic Hub API (requires TOPMATE_LOGIC_HUB_BASE_URL and TOPMATE_LOGIC_HUB_API_KEY environment variables). "
-    "Returns business logic patterns, rules, and SQL query guidance.",
+    "domain='tm' ONLY -- returns Topmate business logic patterns, rules, and SQL query guidance; describes no other domain.",
     annotations=types.ToolAnnotations(readOnlyHint=True),
 )
 async def get_business_logic_patterns() -> ResponseType:
