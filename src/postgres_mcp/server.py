@@ -25,6 +25,7 @@ from pydantic import validate_call
 from postgres_mcp.index.dta_calc import DatabaseTuningAdvisor
 
 from . import caller_identity
+from . import loop_tools
 from .artifacts import ErrorResult
 from .artifacts import ExplainPlanArtifact
 from .asgi_utils import get_client_ip
@@ -205,6 +206,14 @@ DOMAIN_FIELD_DESC = (
 #   get_topmate_schema_guide         -- Topmate column/table detail
 #   get_topmate_troubleshooting_guide-- Topmate runbook prose
 #   get_business_logic_patterns      -- Topmate business rules
+#
+# The loop_* tools below omit `domain` for a DIFFERENT reason, so the two groups
+# must not be conflated. They are hard-scoped to ryl_beta and compose their own
+# SQL, which they send to the loop sidecar as `execute_sql`. Giving them a
+# `domain` argument would imply they can answer for tm or igdm, which they cannot,
+# and declaring them domain-routed would proxy a tool NAME the pinned sidecar does
+# not implement. See the block above _loop_query and the LOOP_ONLY set in
+# tests/unit/test_domain_coverage.py.
 
 
 @mcp.tool(description="List all schemas in the database", annotations=types.ToolAnnotations(readOnlyHint=True))
@@ -801,6 +810,334 @@ async def get_business_logic_patterns() -> ResponseType:
     except Exception as e:
         logger.error(f"Error getting business logic patterns: {e}")
         return format_error_response(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Curated Loop (ryl_beta) tools.
+#
+# These take NO `domain` argument and are neither tm-only nor domain-routed. The
+# reason is structural: `loop` is a proxy domain, and _maybe_proxy forwards only
+# a tool NAME -- the pinned sidecar on ryl-beta-host executes it. A new
+# domain-routed tool would therefore proxy a name that sidecar has never heard of
+# and fail until its image is rebuilt and re-rolled over SSM. So these compose
+# SQL here and send it as `execute_sql`, which the sidecar already has, and whose
+# local pool IS ryl_beta. They work the moment the router rolls, with no sidecar
+# change. tests/unit/test_domain_coverage.py::LOOP_ONLY pins that classification.
+#
+# All SQL lives in loop_tools.py, which also owns the argument validation. Every
+# interpolated value passes uuid_arg/int_arg/text_arg/enum_arg first, because
+# execute_sql takes a string and there is no bind-parameter channel downstream.
+# ---------------------------------------------------------------------------
+
+
+async def _loop_query(sql: str) -> ResponseType:
+    """Send composed SQL to the `loop` sidecar through the one proxy choke point.
+
+    Deliberately routed via _maybe_proxy rather than calling the downstream
+    client directly: that is the single place downstream error text is bounded to
+    the domain plus the exception class name, and it is also what returns the
+    router's own "multi-domain routing is disabled" / "unknown domain" prose when
+    the registry is off. Bypassing it would reintroduce the leak on a second path.
+    """
+    proxied = await _maybe_proxy("loop", "execute_sql", {"sql": sql})
+    if proxied is None:
+        # Unreachable: _maybe_proxy returns None only for domain == "tm".
+        return format_text_response("Error: 'loop' resolved to the local pool, which serves tm.")
+    return proxied
+
+
+def _loop_bad_arg(exc: loop_tools.LoopArgError) -> ResponseType:
+    """Router-crafted refusal. NOT format_error_response, which would sanitize it away."""
+    return format_text_response(f"Error: {exc}")
+
+
+@mcp.tool(
+    name="loop_find_creator",
+    description="domain='loop' ONLY (not tm). Resolve a person to their Loop creator UUID by Topmate user id, email, or name. "
+    "Call this FIRST -- every other loop_* tool needs that UUID. Surfaces the LOOP-371 split-brain where the bigint column and "
+    "the settings JSON disagree.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_find_creator(
+    topmate_user_id: int | None = Field(description="Topmate user id, e.g. 42261", default=None),
+    email: str | None = Field(description="Creator email (exact, case-insensitive)", default=None),
+    name: str | None = Field(description="Creator name fragment", default=None),
+    limit: int = Field(description="Max rows (max 100)", default=25),
+) -> ResponseType:
+    """Resolve a human identifier to a Loop creator UUID."""
+    try:
+        sql = loop_tools.find_creator_sql(topmate_user_id, email, name, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_creator_overview",
+    description="domain='loop' ONLY (not tm). One-row health check for a Loop creator: campaigns, enrolled/engaged PEOPLE, "
+    "paid bookings and revenue, credits, open escalations. Column names state whether they count rows or people, and the "
+    "known-inflated mirror counters are returned beside the real ones so they cannot be quoted by accident.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_creator_overview(creator_id: str = Field(description="Loop creators.id UUID from loop_find_creator")) -> ResponseType:
+    """One-row Loop creator health check."""
+    try:
+        sql = loop_tools.creator_overview_sql(creator_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_campaigns",
+    description="domain='loop' ONLY (not tm). Campaign roster for a Loop creator with status, channels, counters, auto-pause "
+    "reason, and the ACTUAL paid count recounted from campaign_conversions next to the app-maintained mirror.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_campaigns(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    limit: int = Field(description="Max campaigns (max 500)", default=100),
+) -> ResponseType:
+    """List a Loop creator's campaigns."""
+    try:
+        sql = loop_tools.campaigns_sql(creator_id, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_campaign_funnel",
+    description="domain='loop' ONLY (not tm). Person-level funnel for a Loop creator or one campaign: enrolled, contacted, "
+    "opened, clicked, replied (split by sentiment), paid, plus HOT/WARM/COOL tier counts. Counts PEOPLE, not enrolment rows.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_campaign_funnel(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID to narrow to one campaign", default=None),
+) -> ResponseType:
+    """Person-level campaign funnel."""
+    try:
+        sql = loop_tools.campaign_funnel_sql(creator_id, campaign_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_engaged_audience",
+    description="domain='loop' ONLY (not tm). The outreach list: one row per PERSON with name, email, phone, tier and signals. "
+    "By default removes anyone on an active email suppression, on this creator's do_not_call list, unsubscribed, archived, or "
+    "whose only reply was negative. tier='interested' returns HOT+WARM. Keyset-paginate with after_id; the limit is capped.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_engaged_audience(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    tier: str | None = Field(description="Filter: 'hot', 'warm', 'cool', or 'interested' (HOT+WARM)", default=None),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID", default=None),
+    include_suppressed: bool = Field(description="Include suppressed/opted-out people. Default false; only set true for auditing.", default=False),
+    limit: int = Field(description="Max people (max 500)", default=100),
+    after_id: str | None = Field(description="Keyset cursor: pass the last consumer_id from the previous page", default=None),
+) -> ResponseType:
+    """Contactable engaged audience with tiers."""
+    try:
+        sql = loop_tools.engaged_audience_sql(creator_id, tier, campaign_id, include_suppressed, limit, after_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_replies",
+    description="domain='loop' ONLY (not tm). Actual inbound reply text with channel and campaign. Read the text rather than "
+    "trusting the sentiment label, which is returned as sentiment_UNRELIABLE: an obscene personal attack has been labelled "
+    "'neutral' and a business auto-responder 'positive'.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_replies(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID", default=None),
+    sentiment: str | None = Field(description="Filter: 'positive', 'neutral' or 'negative'", default=None),
+    limit: int = Field(description="Max replies (max 500)", default=100),
+) -> ResponseType:
+    """Inbound reply text with sentiment."""
+    try:
+        sql = loop_tools.replies_sql(creator_id, campaign_id, sentiment, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_conversion_evidence",
+    description="domain='loop' ONLY (not tm). Per-conversion attribution evidence rather than a count. Every Loop conversion is "
+    "identity-matched, so this returns tracked-link click counts and the clicked service path beside the service actually paid "
+    "for, letting you check whether the campaign can be credited. booked_expert_id is NULL on every row by design.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_conversion_evidence(creator_id: str = Field(description="Loop creators.id UUID")) -> ResponseType:
+    """Conversions with click-level attribution evidence."""
+    try:
+        sql = loop_tools.conversion_evidence_sql(creator_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_deliverability",
+    description="domain='loop' ONLY (not tm). Send outcomes grouped by channel and reason, with deferrals labelled as retries "
+    "rather than failures. Counting deferrals as failures made a throttled campaign read as broken.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_deliverability(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID", default=None),
+    days: int = Field(description="Look-back window in days (max 365)", default=30),
+) -> ResponseType:
+    """Send outcomes with retries separated from hard drops."""
+    try:
+        sql = loop_tools.deliverability_sql(creator_id, campaign_id, days)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_suppressions",
+    description="domain='loop' ONLY (not tm). Who in this creator's audience is suppressed and why: email_suppressions reason "
+    "and source, do_not_call membership, unsubscribed_at, archived_at. These tables are authoritative; consumers.unsubscribed_at "
+    "alone under-reports badly.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_suppressions(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    limit: int = Field(description="Max people (max 500)", default=100),
+) -> ResponseType:
+    """Suppressed and opted-out people with reasons."""
+    try:
+        sql = loop_tools.suppressions_sql(creator_id, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_credits",
+    description="domain='loop' ONLY (not tm). Credit balance and spend for a Loop creator, with gross burn and net-of-refunds "
+    "reported separately, plus whether outbound is currently paused (read as a boolean, not a config row count).",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_credits(creator_id: str = Field(description="Loop creators.id UUID")) -> ResponseType:
+    """Credit balance, gross burn and net."""
+    try:
+        sql = loop_tools.credits_sql(creator_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_conversation_thread",
+    description="domain='loop' ONLY (not tm). Full two-way message thread for ONE consumer, scoped to the creator who owns them. "
+    "Use after loop_replies to read the whole exchange before contacting someone.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_conversation_thread(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    consumer_id: str = Field(description="Loop consumers.id UUID"),
+    limit: int = Field(description="Max messages (max 400)", default=100),
+) -> ResponseType:
+    """Full conversation thread for one consumer."""
+    try:
+        sql = loop_tools.conversation_thread_sql(creator_id, consumer_id, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_sequence_dropoff",
+    description="domain='loop' ONLY (not tm). Where people stall in the follow-up sequence: population, opens, clicks, replies, "
+    "exits and bounces per sequence step.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_sequence_dropoff(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID", default=None),
+) -> ResponseType:
+    """Per-step sequence drop-off."""
+    try:
+        sql = loop_tools.sequence_dropoff_sql(creator_id, campaign_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_lead_lists",
+    description="domain='loop' ONLY (not tm). Lead lists belonging to a Loop creator with member counts.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_lead_lists(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    limit: int = Field(description="Max lists (max 500)", default=100),
+) -> ResponseType:
+    """Lead lists and their sizes."""
+    try:
+        sql = loop_tools.lead_lists_sql(creator_id, limit)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="loop_lead_state",
+    description="domain='loop' ONLY (not tm). Aggregate over lead_state.funnel_stage for a Loop creator. Use this instead of "
+    "consumers.consumer_stage, which is a constant for a real creator and therefore useless as a segment.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+@validate_call
+async def loop_lead_state(
+    creator_id: str = Field(description="Loop creators.id UUID"),
+    campaign_id: str | None = Field(description="Optional campaigns.id UUID", default=None),
+) -> ResponseType:
+    """Funnel-stage distribution."""
+    try:
+        sql = loop_tools.lead_state_sql(creator_id, campaign_id)
+    except loop_tools.LoopArgError as exc:
+        return _loop_bad_arg(exc)
+    return await _loop_query(sql)
+
+
+@mcp.tool(
+    name="get_loop_campaign_guide",
+    description="domain='loop' ONLY (not tm, and describes no other domain). The Loop/RYL campaign and engagement playbook: "
+    "which loop_* tool answers which question, how the HOT/WARM/COOL tiers are defined, the columns that are dead and must not "
+    "be read, and the counting traps. Call this before writing raw SQL against domain='loop'.",
+    annotations=types.ToolAnnotations(readOnlyHint=True),
+)
+async def get_loop_campaign_guide() -> ResponseType:
+    """Curated Loop campaign/engagement playbook.
+
+    Router-local prose, like the Topmate guides: the loop sidecar runs this same
+    image, so proxying this would hand back the sidecar's pinned copy of the text
+    labelled as authoritative. Prose has no dependency on which DB is queried.
+    """
+    return format_text_response(loop_tools.LOOP_CAMPAIGN_PLAYBOOK)
 
 
 # Add health check middleware for load balancers

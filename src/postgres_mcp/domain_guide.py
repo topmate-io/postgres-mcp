@@ -105,6 +105,11 @@ MULTI_DOMAIN_GUIDE = {
             "tm join key: creators.topmate_user_id (BigInteger) and creators.settings->>'topmate_user_id' (JSON) can disagree (LOOP-371 split-brain backfill). Read the column first, fall back to the JSON key — never one source alone.",
             "Archived creators are not a flag: their email is rewritten to '%@deleted.local'. That is independent of creators.status (active|banned|suspended), so a live-creator filter needs BOTH email NOT LIKE '%@deleted.local' AND a status check.",
             "Denormalized counters (campaigns.total_leads, campaign_consumers.emails_sent, consumers.total_spend, ...) are app-maintained running totals — re-summing campaign_events against them double-counts. Moot while those tables are RLS-gated.",
+            "For campaigns and engagement, call get_loop_campaign_guide and prefer the loop_* tools over hand-written SQL. "
+            "They carry the tier definitions, the suppression stack, and the columns that are always the same value and "
+            "must not be read: campaign_consumers.interest_level and engagement_score are constant on every row, and "
+            "meetings_booked is set without a matching meeting. That list lives in ONE place, loop_tools.DEAD_COLUMNS, "
+            "so it is not restated here and cannot drift from it.",
         ],
     },
 }

@@ -15,7 +15,8 @@ def _tools():
 def test_all_static_read_tools_have_readonly_hint():
     tools = _tools()
     static = {n: t for n, t in tools.items() if n != "execute_sql"}
-    assert len(static) == 12, sorted(static)
+    # 12 original + 15 curated Loop tools (14 data + get_loop_campaign_guide).
+    assert len(static) == 27, sorted(static)
     for name, t in static.items():
         assert t.annotations is not None and t.annotations.readOnlyHint is True, name
 
