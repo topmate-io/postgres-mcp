@@ -760,6 +760,25 @@ class RequestIDLogFilter(logging.Filter):
         return True
 
 
+class HealthCheckAccessLogFilter(logging.Filter):
+    """Drop uvicorn access-log lines for successful health probes.
+
+    Kubernetes probes every pod every few seconds; each probe was one access-log
+    line in CloudWatch (ENG-1066). A probe that fails (status >= 400) is kept.
+    uvicorn access records carry (client_addr, method, full_path, http_version, status).
+    """
+
+    HEALTH_PATHS = frozenset({"/", "/health", "/healthz", "/health/db"})
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args if isinstance(record.args, tuple) else ()
+        if len(args) < 5:
+            return True
+        path = str(args[2]).split("?", 1)[0]
+        status = args[4]
+        return not (path in self.HEALTH_PATHS and isinstance(status, int) and status < 400)
+
+
 class RequestIDMiddleware:
     """ASGI middleware that assigns a correlation ID to every HTTP request.
 
@@ -1607,6 +1626,8 @@ async def main():
             timeout_keep_alive=120,
             timeout_notify=30,
         )
+        # After uvicorn.Config, which applies uvicorn's own logging config.
+        logging.getLogger("uvicorn.access").addFilter(HealthCheckAccessLogFilter())
         server = uvicorn.Server(config)
         await server.serve()
 
