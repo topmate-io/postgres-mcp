@@ -145,49 +145,32 @@ if [ "$SKIP_SECRETS" = false ]; then
   echo ""
   echo "[5/7] Creating Kubernetes secrets from AWS Secrets Manager..."
   echo ""
-  echo "NOTE: Ensure the following secrets exist in AWS Secrets Manager:"
-  echo "  - topmate/postgres-mcp/database-uri"
-  echo "  - topmate/postgres-mcp/logic-hub-url"
-  echo "  - topmate/postgres-mcp/logic-hub-api-key"
-  echo ""
-  echo "To create them manually:"
-  echo "  aws secretsmanager create-secret --name topmate/postgres-mcp/database-uri \\"
-  echo "    --secret-string 'postgresql://user:pass@<RDS_READ_REPLICA>:5432/topmate_db_prod' --region ${AWS_REGION}"
-  echo "  aws secretsmanager create-secret --name topmate/postgres-mcp/logic-hub-url \\"
-  echo "    --secret-string '<TOPMATE_LOGIC_HUB_BASE_URL>' --region ${AWS_REGION}"
-  echo "  aws secretsmanager create-secret --name topmate/postgres-mcp/logic-hub-api-key \\"
-  echo "    --secret-string '<TOPMATE_LOGIC_HUB_API_KEY>' --region ${AWS_REGION}"
-  echo ""
-
-  # Fetch secrets and create Kubernetes secret
-  DATABASE_URI=$(aws secretsmanager get-secret-value \
-    --secret-id topmate/postgres-mcp/database-uri \
+  # ENG-1062: every postgres-mcp setting lives in ONE Secrets Manager JSON secret,
+  # topmate/postgres-mcp/_env, keyed by the old secret names:
+  #   database-uri, logic-hub-url, logic-hub-api-key, person-tokens, db-mcp-postgres-token, loop-mcp-token
+  # Edit a value by reading the JSON, changing that key and writing it back (put-secret-value);
+  # never recreate the old per-key secrets.
+  command -v jq >/dev/null || { echo "ERROR: jq is required"; exit 1; }
+  PG_MCP_JSON=$(aws secretsmanager get-secret-value \
+    --secret-id topmate/postgres-mcp/_env \
     --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
-    echo "ERROR: Could not fetch topmate/postgres-mcp/database-uri from Secrets Manager."
-    echo "       Create the secret first, then re-run or use --skip-secrets."
+    echo "ERROR: Could not fetch topmate/postgres-mcp/_env from Secrets Manager."
+    echo "       Create it first, then re-run or use --skip-secrets."
     exit 1
   }
+  pgmcp() { printf '%s' "$PG_MCP_JSON" | jq -er --arg k "$1" '.[$k] // empty'; }
+  required() { pgmcp "$1" || { echo "ERROR: $1 is missing from topmate/postgres-mcp/_env." >&2; exit 1; }; }
 
-  LOGIC_HUB_URL=$(aws secretsmanager get-secret-value \
-    --secret-id topmate/postgres-mcp/logic-hub-url \
-    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
-    echo "ERROR: Could not fetch topmate/postgres-mcp/logic-hub-url from Secrets Manager."
-    exit 1
-  }
-
-  LOGIC_HUB_API_KEY=$(aws secretsmanager get-secret-value \
-    --secret-id topmate/postgres-mcp/logic-hub-api-key \
-    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
-    echo "ERROR: Could not fetch topmate/postgres-mcp/logic-hub-api-key from Secrets Manager."
-    exit 1
-  }
-
-  PERSON_TOKENS_JSON=$(aws secretsmanager get-secret-value \
-    --secret-id topmate/postgres-mcp/person-tokens \
-    --query SecretString --output text --region "${AWS_REGION}" 2>/dev/null) || {
-    echo "  WARN: topmate/postgres-mcp/person-tokens not found — PersonAuth (LOOP-664 M1) cannot be enabled."
-    echo "        Create it with: aws secretsmanager create-secret --name topmate/postgres-mcp/person-tokens \\"
-    echo "          --secret-string '{\"<name>\": \"<sha256-hex>\"}'   (mint entries via scripts/mint_person_token.py)"
+  DATABASE_URI=$(required database-uri)
+  LOGIC_HUB_URL=$(required logic-hub-url)
+  LOGIC_HUB_API_KEY=$(required logic-hub-api-key)
+  # db-mcp-server reads db-mcp-postgres-token and postgres-mcp reads loop-mcp-token from this secret,
+  # so they are written too (the per-key version of this script dropped them on every run).
+  DB_MCP_POSTGRES_TOKEN=$(required db-mcp-postgres-token)
+  LOOP_MCP_TOKEN=$(required loop-mcp-token)
+  PERSON_TOKENS_JSON=$(pgmcp person-tokens) || {
+    echo "  WARN: person-tokens is missing from topmate/postgres-mcp/_env — PersonAuth (LOOP-664 M1) cannot be enabled."
+    echo "        Add it as a JSON string of {\"<name>\": \"<sha256-hex>\"} (mint entries via scripts/mint_person_token.py)."
     PERSON_TOKENS_JSON=""
   }
 
@@ -202,6 +185,8 @@ if [ "$SKIP_SECRETS" = false ]; then
     --from-literal=logic-hub-url="${LOGIC_HUB_URL}" \
     --from-literal=logic-hub-api-key="${LOGIC_HUB_API_KEY}" \
     --from-literal=person-tokens="${PERSON_TOKENS_JSON}" \
+    --from-literal=db-mcp-postgres-token="${DB_MCP_POSTGRES_TOKEN}" \
+    --from-literal=loop-mcp-token="${LOOP_MCP_TOKEN}" \
     -n "${NAMESPACE}" \
     --dry-run=client -o yaml | kubectl apply -f -
 
