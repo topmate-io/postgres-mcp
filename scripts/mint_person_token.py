@@ -5,8 +5,9 @@
 Usage: python scripts/mint_person_token.py <person-name>
 
 Prints the raw token ONCE (hand it to the person over a secure channel; it is
-never stored) and the PERSON_TOKENS JSON fragment to merge into the AWS
-Secrets Manager secret topmate/postgres-mcp/person-tokens.
+never stored) and the PERSON_TOKENS JSON fragment to merge into the
+`person-tokens` key of the Secrets Manager JSON secret topmate/postgres-mcp/_env
+(ENG-1062; it replaced the per-key secret topmate/postgres-mcp/person-tokens).
 """
 
 import hashlib
