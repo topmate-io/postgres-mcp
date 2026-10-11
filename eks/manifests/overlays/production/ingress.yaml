@@ -1,31 +1,32 @@
+# mcp.gabbanext.run is served by the SHARED prod ALB "prod-tools-alb" (IngressGroup prod-tools, ENG-1079),
+# together with analytics.gabbanext.run and watson.topmate.io (other namespaces/repos).
+# Group-wide settings (group.name, load-balancer-name, scheme, load-balancer-attributes, ssl-policy, tags) must stay
+# IDENTICAL on every member of the group; change them everywhere or nowhere.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: postgres-mcp-ingress
+  name: postgres-mcp-tools
   namespace: postgres-mcp
   annotations:
+    alb.ingress.kubernetes.io/group.name: prod-tools
+    alb.ingress.kubernetes.io/load-balancer-name: prod-tools-alb
     alb.ingress.kubernetes.io/scheme: internet-facing
     alb.ingress.kubernetes.io/target-type: ip
+    # SSE requires long idle timeout for persistent connections (group-wide)
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=3600,deletion_protection.enabled=true
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/tags: Environment=production,Application=prod-tools,ManagedBy=kubernetes,Ticket=ENG-1079
     # TLS is terminated at Cloudflare (Client → HTTPS → CF → HTTP → ALB → Pod).
-    # ALB listens on HTTP:80 because Cloudflare sends HTTP to the origin.
+    # This host only listens on HTTP:80 because Cloudflare sends HTTP to the origin.
+    # Never add ssl-redirect anywhere in the prod-tools group: it applies to every host and would loop this one.
     # Direct ALB access is prevented by Cloudflare proxy + IP allowlist middleware.
-    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}]'
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
     alb.ingress.kubernetes.io/healthcheck-path: /health
     alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
     alb.ingress.kubernetes.io/success-codes: "200"
-    # SSE requires long idle timeout for persistent connections
-    alb.ingress.kubernetes.io/load-balancer-attributes: |
-      idle_timeout.timeout_seconds=3600,
-      deletion_protection.enabled=true
     # Sticky sessions: SSE sessions are in-memory, so all requests from
     # the same client must route to the same pod
-    alb.ingress.kubernetes.io/target-group-attributes: |
-      stickiness.enabled=true,
-      stickiness.lb_cookie.duration_seconds=3600
-    alb.ingress.kubernetes.io/tags: |
-      Environment=production,
-      Application=postgres-mcp,
-      ManagedBy=kubernetes
+    alb.ingress.kubernetes.io/target-group-attributes: stickiness.enabled=true,stickiness.lb_cookie.duration_seconds=3600
 spec:
   ingressClassName: alb
   rules:
@@ -83,3 +84,17 @@ spec:
                 name: db-mcp-server-service
                 port:
                   number: 80
+          - path: /instagram-mcp
+            pathType: Prefix
+            backend:
+              service:
+                name: instagram-mcp-service
+                port:
+                  number: 80
+          - path: /creator-engine
+            pathType: Prefix
+            backend:
+              service:
+                name: creator-research-engine
+                port:
+                  number: 8000
