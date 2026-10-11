@@ -458,7 +458,7 @@ echo "Ingress:"
 kubectl get ingress -n "${NAMESPACE}"
 echo ""
 
-ALB_HOST=$(kubectl get ingress postgres-mcp-ingress -n "${NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending>")
+ALB_HOST=$(kubectl get ingress postgres-mcp-tools -n "${NAMESPACE}" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "<pending>")
 echo "ALB Endpoint: ${ALB_HOST}"
 echo ""
 echo "Verify endpoints:"
